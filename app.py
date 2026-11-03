@@ -3,6 +3,7 @@ import ccxt
 import yfinance as yf
 import pandas as pd
 import numpy as np
+import math
 import pandas_ta as ta  # noqa: F401  (df.ta 접근자 등록용)
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
@@ -44,7 +45,7 @@ SL_ATR_MULT = 1.5          # 손절 = 진입가 - 1.5 ATR (또는 직전 저점 
 TP1_ATR_MULT = 2.0         # 1차(생존형) 익절 = 진입가 + 2.0 ATR
 TP_ATR_MULT = 3.0          # 2차(구조적) 익절의 대체값 = 진입가 + 3.0 ATR (위쪽 저항이 없을 때)
 TP3_TRAIL_ATR = 3.0        # 3차(추세 추종) 트레일링 스탑 = 진입 후 고점 - 3.0 ATR
-TP_WEIGHTS = (0.4, 0.4, 0.2)   # 3분할 청산 비중 (1차 / 2차 / 3차)
+TP_WEIGHTS = (0.4, 0.4, 0.2)   # 기대 손익비(rr_blend) 추정용 가중치 — 화면의 청산 안내는 '1차 50% + 잔여 트레일링' 2단계
 HIST_BARS = 60             # '과거 국면 표시'에서 다시 판정할 최근 봉 수 (연산량 제한)
 MIN_RISK_ATR = 0.8         # 손절폭 최소값 (너무 타이트한 손절 방지)
 RES_MIN_GAP_ATR = 1.0      # 다음 저항으로 인정할 최소 거리 (ATR 배수)
@@ -463,6 +464,31 @@ def mtf_at(pack, t64):
     k = int(np.searchsorted(pack['done'], t64, side='right'))
     return htf_regime(pack['df'].iloc[:k], pack['label'])
 
+REGIME_SMA = 200          # 일봉 거시 추세 기준선 (단순이평)
+REGIME_SLOPE_N = 20       # 기울기 판단 구간 (봉)
+
+def daily_regime(df):
+    """
+    일봉 데이터 '안에서' 200일 단순이평의 위치·기울기로 거시 추세 판정 (외부 호출 없음).
+    스크리너와 상세 분석(1일 프레임)이 같은 함수를 써서 판정이 뒤집히지 않게 함.
+      bear    : 종가 < 200일선 이고 200일선이 아직 내려가는 중  → 반등(CHoCH)은 데드캣으로 보고 매수 차단
+      bull    : 종가 > 200일선 이고 200일선이 올라가는 중
+      neutral : 그 외 (200일선 아래라도 기울기가 멈추면 무릎 매수 후보를 막지 않음)
+    """
+    c = df['close'].iloc[:-1] if len(df) > 1 else df['close']        # 진행 중인 봉 제외
+    base = {"label": "일봉", "span": REGIME_SMA, "approx": False, "kind": "SMA"}
+    if len(c) < REGIME_SMA + REGIME_SLOPE_N:
+        return {"state": "n/a", **base}
+    sma = c.rolling(REGIME_SMA).mean()
+    s_now, s_prev, px = float(sma.iloc[-1]), float(sma.iloc[-1 - REGIME_SLOPE_N]), float(c.iloc[-1])
+    if px < s_now and s_now < s_prev:
+        state = "bear"
+    elif px > s_now and s_now > s_prev:
+        state = "bull"
+    else:
+        state = "neutral"
+    return {"state": state, **base, "sma": s_now, "gap_pct": px / s_now - 1, "slope_pct": s_now / s_prev - 1}
+
 def _features(d):
     """분석 구간(d)에서 점수·SMC 판정에 필요한 원시 변수를 계산 (d 안의 데이터만 사용)"""
     n = len(d)
@@ -707,7 +733,10 @@ def analyze_market_cycle(df, mtf=None, macro=None, with_facts=True):
     if not all(F.triple.values()) and totals["매집"] > ACC_CAP_NO_TRIPLE:
         totals["매집"] = ACC_CAP_NO_TRIPLE
         adjust.append(f"진바닥 3박자 미충족 → 매집 상한 {ACC_CAP_NO_TRIPLE}")
-    if veto:
+    if veto and mtf.get("kind") == "SMA":
+        # 일봉 200일선 모드: 돌파 매수만 차단(BLOCKED)하고, 매집 판정은 관심 종목 관찰용으로 남김
+        adjust.append("200일선 아래 · 200일선 하락 중 → 돌파 매수 차단 (매집은 관찰만)")
+    elif veto:
         totals["매집"] = int(totals["매집"] * (1 - MTF_VETO_RATIO))
         adjust.append(f"상위 프레임({mtf['label']}) 하락 → 매집 " + ("무효화" if MTF_VETO_RATIO >= 1 else "감점"))
     if bear_break:
@@ -769,17 +798,23 @@ def analyze_market_cycle(df, mtf=None, macro=None, with_facts=True):
         f_ema += f" 급락 추세 속 일시 횡보(베어플래그) 의심으로 매집 점수 -{BEARFLAG_PENALTY}점을 적용했습니다."
     if mtf is not None:
         lab = mtf['label']
-        if mtf['state'] == "n/a":
-            f_ema += f" 상위 프레임({lab}) 데이터가 부족해 거시 추세 필터는 적용되지 않았습니다."
+        if mtf.get('kind') == "SMA":       # 일봉 내부 200일선 레짐
+            src = f"{mtf['span']}일선"
+            gap = f" (현재가 {mtf['gap_pct'] * 100:+.1f}%, 기울기 {'상승' if mtf['slope_pct'] > 0 else '하락'})" if 'gap_pct' in mtf else ""
         else:
-            ap = f"({mtf['span']}EMA 근사)" if mtf['approx'] else f"({mtf['span']}EMA)"
-            if mtf['state'] == "bear":
-                f_ema += (f" 상위 프레임({lab}) 장기 추세{ap}가 하락 중이라 매집 신호를 "
-                          + ("무효 처리합니다(데드캣 바운스 경계)." if MTF_VETO_RATIO >= 1 else "감점합니다."))
-            elif mtf['state'] == "bull":
-                f_ema += f" 상위 프레임({lab}) 장기 추세{ap}는 상승입니다."
-            else:
-                f_ema += f" 상위 프레임({lab}) 장기 추세{ap}는 뚜렷하지 않습니다."
+            src = f"상위 프레임({lab}) 장기 추세" + (f"({mtf['span']}EMA 근사)" if mtf['approx'] else f"({mtf['span']}EMA)")
+            gap = ""
+        if mtf['state'] == "n/a":
+            f_ema += f" {src} 판정에 필요한 데이터가 부족해 거시 추세 필터는 적용되지 않았습니다."
+        elif mtf['state'] == "bear" and mtf.get('kind') == "SMA":
+            f_ema += f" {src}{gap} 아래에서 200일선이 아직 내려가는 중이라, 반등 돌파가 나와도 매수를 차단합니다(데드캣 바운스 경계)."
+        elif mtf['state'] == "bear":
+            f_ema += (f" {src}{gap}가 하락 중이라 매집·반등 신호를 "
+                      + ("무효 처리합니다(데드캣 바운스 경계)." if MTF_VETO_RATIO >= 1 else "감점합니다."))
+        elif mtf['state'] == "bull":
+            f_ema += f" {src}{gap}는 상승입니다."
+        else:
+            f_ema += f" {src}{gap}는 뚜렷하지 않습니다."
 
     pct = f"{pos * 100:.0f}%"
     nb = len(F.w)
@@ -912,6 +947,12 @@ def analyze_market_cycle(df, mtf=None, macro=None, with_facts=True):
 # ==========================================
 # 매매 계획: ATR 손절·익절, 기대 손익비, 권장 비중
 # ==========================================
+def structural_target(L, price, atr):
+    """현재가보다 RES_MIN_GAP_ATR(1 ATR) 이상 위에 있는 가장 가까운 저항(VAH·POC·전고점·범위 고점). 없으면 3 ATR 위."""
+    cands = sorted((v, lab) for lab, v in (L.get('resistances') or [])
+                   if v is not None and np.isfinite(v) and v > price + RES_MIN_GAP_ATR * atr)
+    return cands[0] if cands else (price + TP_ATR_MULT * atr, f"ATR {TP_ATR_MULT}배")
+
 def build_trade_plan(info, entry=None, assume_trigger=False):
     """진입가(기본: 현재가) 기준 SL/TP, 다음 저항까지의 손익비, 1% 룰 기반 권장 비중. 계산 불가면 None."""
     L = info['levels']
@@ -948,6 +989,9 @@ def build_trade_plan(info, entry=None, assume_trigger=False):
     tp3_rule = f"진입 후 고점 대비 {TP3_TRAIL_ATR} ATR 하락 시 청산"
     if L.get('ema_long'):
         tp3_rule += f" (또는 {LONG_EMA}EMA {_fmt_price(L['ema_long'])} 종가 이탈 시)"
+
+    # 2단계 청산용 '구조적 익절가': 현재가보다 1 ATR 이상 위에 있는 가장 가까운 매물대 저항 (없으면 3 ATR)
+    tp_struct = structural_target(L, price, atr)
 
     w1, w2, w3 = TP_WEIGHTS
     rr_tp1 = (tp1 - price) / risk
@@ -991,11 +1035,13 @@ def build_trade_plan(info, entry=None, assume_trigger=False):
             "tp3_rule": tp3_rule, "tp3_w": w3,
             "rr": rr, "rr_tp1": rr_tp1, "rr_tp2": rr_tp2, "rr_blend": rr_blend,
             "rr_basis": tp2_label, "risk_pct": risk_pct,
+            "tp_struct": tp_struct[0], "tp_struct_label": tp_struct[1], "tp_struct_pct": (tp_struct[0] / price - 1) * 100,
+            "rr_struct": (tp_struct[0] - price) / risk,
             "risk_cap": risk_cap, "scale": scale, "conf": conf, "notes": notes,
             "position_pct": position_pct, "blocked": blocked}
 
 @st.cache_data(ttl=300)
-def cached_phase_history(df, htf_pack=None, bars=HIST_BARS, min_start=60):
+def cached_phase_history(df, htf_pack=None, bars=HIST_BARS, min_start=60, daily=False):
     """최근 bars봉만, 각 시점에서 '그 시점까지의 데이터'로 다시 판별한 국면 구간 (검증용 · 연산량 제한)"""
     start = max(len(df) - bars, min_start)
     if start >= len(df):
@@ -1003,7 +1049,9 @@ def cached_phase_history(df, htf_pack=None, bars=HIST_BARS, min_start=60):
     tn = _naive(df['time']).to_numpy(dtype='datetime64[ns]')
     labels = []
     for i in range(start, len(df)):
-        labels.append(analyze_market_cycle(df.iloc[:i + 1], mtf_at(htf_pack, tn[i]), None, False)['phase'])
+        sub = df.iloc[:i + 1]
+        mtf_i = daily_regime(sub) if daily else mtf_at(htf_pack, tn[i])       # 화면 판정과 같은 거시 필터
+        labels.append(analyze_market_cycle(sub, mtf_i, None, False)['phase'])
     runs = []
     for k, ph in enumerate(labels):
         if runs and runs[-1][0] == ph:
@@ -1032,7 +1080,7 @@ def calculate_fibonacci_levels(df, is_commodity=False, window=RANGE_N):
 # 화면 구성 요소
 # ==========================================
 def render_phase_legend():
-    with st.expander("📌 시장 국면 가이드 (매집 → 상승 → 분배 → 하락)", expanded=True):
+    with st.expander("📌 시장 국면 가이드 (매집 → 상승 → 분배 → 하락)", expanded=False):
         st.markdown("- 🔵 **매집**: `[바닥권 횡보 · 거래량 감소 · 저점 상승]` - 셋업 확인 후 CHoCH 트리거에서만 매수")
         st.markdown("- 🟢 **상승**: `[정배열 · 고점/저점 상승]` - 보유 유지, 눌림목만 매수 (추격 주의)")
         st.markdown("- 🟣 **분배**: `[고점권 거래량 폭증 · 윗꼬리 · 고점 하락]` - 신규 매수 금지, 분할 매도")
@@ -1040,7 +1088,8 @@ def render_phase_legend():
         st.markdown("- 🧲 **Phase 1 셋업**: `[장기선 이탈 + 변동성 수축 + 소진 신호]` → 관심 종목 편입 (매수 아님)")
         st.markdown("- 🎯 **Phase 2 트리거**: `[종가가 직전 반등 고점(IBSL)을 돌파·안착 = Bullish CHoCH]` → 실전 매수 타점")
         st.markdown("- 🅰️ **A급 트리거**: `[SSL 유동성 스윕 + 모멘텀 다이버전스 + CHoCH]` 3중 교차 검증 → 최대 비중")
-        st.markdown("- 💰 **청산**: `1차 40%(2ATR, 도달 시 손절선을 본절로)` → `2차 40%(저항·VAH)` → `3차 20%(트레일링 스탑)`")
+        st.markdown("- 💰 **청산**: `1차 50%(구조적 저항 · 도달 시 손절선을 본절로)` → `잔여 50%(트레일링 스탑: 고점 − 3 ATR)`")
+        st.markdown("- ⚠️ **3박자·매집 점수는 '관심 종목' 기준일 뿐**입니다. 실제 매수는 맨 위 결론이 🟢 매수 실행일 때만 하세요.")
 
 def render_fact_box(facts):
     with st.container(border=True):
@@ -1051,22 +1100,22 @@ def render_fact_box(facts):
         st.markdown(f"- **[수급 VOL]**: {facts['VOL']}")
         st.markdown(f"- **[구조 SMC]**: {facts['SMC']}")
 
-def _render_plan(plan, rate, title):
+def _render_plan(plan, rate, title, show_entry=True, show_size=False):
     def fmt(v): return f"₩{v * rate:,.0f}"
     st.markdown(f"**{title}**")
-    st.markdown(f"- 진입 기준가: {fmt(plan['entry'])}")
-    st.markdown(f"- 🛑 권장 손절선(무효화 라인): {fmt(plan['sl'])} ({plan['sl_pct']:+.1f}%) · 기준: {plan['sl_kind']}")
-    st.markdown("- 🎯 **3분할 청산**")
-    st.markdown(f"    - 1차 (물량 {plan['tp1_w'] * 100:.0f}%, 생존형 · {plan['tp1_label']}): "
-                f"{fmt(plan['tp1'])} ({plan['tp1_pct']:+.1f}%) · 손익비 1:{plan['rr_tp1']:.1f}")
+    if show_entry:
+        st.markdown(f"- 진입 기준가: {fmt(plan['entry'])}")
+        st.markdown(f"- 🛑 권장 손절선(무효화 라인): {fmt(plan['sl'])} ({plan['sl_pct']:+.1f}%) · 기준: {plan['sl_kind']}")
+    st.markdown("- 🎯 **2단계 청산** (💼 포지션 관리 탭과 같은 기준)")
+    st.markdown(f"    - 1차 (물량 50%, 구조적 익절 · {plan['tp_struct_label']}): "
+                f"{fmt(plan['tp_struct'])} ({plan['tp_struct_pct']:+.1f}%) · 손익비 1:{plan['rr_struct']:.1f}")
     st.markdown(f"    - ⚠️ 1차 도달 시 **잔여 물량의 손절선을 진입가({fmt(plan['entry'])})로 상향 조정**해 "
                 "무위험(Risk-Free) 트레이딩으로 전환하세요.")
-    st.markdown(f"    - 2차 (물량 {plan['tp2_w'] * 100:.0f}%, 구조적 · {plan['tp2_label']}): "
-                f"{fmt(plan['tp2'])} ({plan['tp2_pct']:+.1f}%) · 손익비 1:{plan['rr_tp2']:.1f}")
-    st.markdown(f"    - 3차 (물량 {plan['tp3_w'] * 100:.0f}%, 추세 추종): {plan['tp3_rule']}")
-    st.markdown(f"- ⚖️ 분할 청산 기대 손익비: 1 : {plan['rr_blend']:.1f} "
-                f"(3차는 2차 수준 청산으로 보수적 가정) · 손절폭 {plan['risk_pct']:.1f}%")
-    if plan['blocked']:
+    st.markdown(f"    - 잔여 (물량 50%, 추세 추종): {plan['tp3_rule']} — 손절선은 올리기만 하고 내리지 않습니다.")
+    st.markdown(f"- ⚖️ 기대 손익비(참고): 1 : {plan['rr_blend']:.1f} · 손절폭 {plan['risk_pct']:.1f}%")
+    if not show_size:
+        st.caption("진입 가격·수량·공통 손절가는 맨 위 결론과 🧮 2분할 진입 플랜을 따르세요.")
+    elif plan['blocked']:
         st.markdown(f"- 📦 권장 비중: **0% (신규 진입 차단)** — {plan['blocked']}")
     else:
         extra = (" · " + ", ".join(plan['notes'])) if plan['notes'] else ""
@@ -1098,12 +1147,12 @@ def render_trade_guide(info, fibs, curr, rate):
             st.warning("📈 Bullish CHoCH는 확정됐지만 바닥 셋업이 선행되지 않았습니다. 저점 매수가 아닌 추세 돌파 진입이므로 비중을 절반 이하로 줄여 분할 접근하세요.")
         plan = build_trade_plan(info)
         if plan:
-            _render_plan(plan, rate, "[실전 매매 계획]")
+            _render_plan(plan, rate, "[청산 계획]", show_entry=False)
         else:
             st.markdown("- ATR을 계산할 수 없어 손절·익절 라인을 산정하지 못했습니다.")
         st.markdown(f"- 리테스트 참고선: IBSL {fmt(smc['choch']['level'])} (종가 이탈 시 신호 실패)")
         if info['phase'] in ("상승",):
-            st.markdown("**[3분할 매도 타점]**")
+            st.markdown("**[매도 참고 가격대 (피보나치)]**")
             st.markdown(f"- {sell_line}")
     elif entry == "PENDING":
         st.info(f"⏳ IBSL 돌파 직후입니다. 종가 안착 확인 전이므로 매수를 보류하세요. (돌파선 {fmt(smc['choch']['level'])})")
@@ -1116,22 +1165,24 @@ def render_trade_guide(info, fibs, curr, rate):
             st.markdown(f"- 🎯 트리거 조건: 종가가 **{fmt(smc['trigger_level'])}** (IBSL {fmt(smc['ibsl'])} + {CHOCH_BREAK_ATR} ATR) 위에 {CHOCH_SETTLE}회 안착")
             preview = build_trade_plan(info, entry=smc['trigger_level'], assume_trigger=True)
             if preview:
-                _render_plan(preview, rate, "[트리거 발생 시 예상 계획 (미리보기)]")
+                _render_plan(preview, rate, "[트리거 발생 시 청산 계획 (미리보기)]", show_entry=False)
         st.markdown(f"- 무효화: 종가가 직전 저점(ISSL {fmt(smc['issl'])}) 아래로 내려가면 셋업 폐기")
     elif entry == "WHIPSAW":
         st.error("🪤 가짜 반등(휩쏘): 직전 저점을 종가 기준으로 이탈했습니다. 매수 점수를 0점으로 삭감했고 매수를 보류하세요.")
     elif entry == "BLOCKED":
-        st.error("🚫 Bullish CHoCH가 나왔지만 상위 프레임이 하락 추세입니다. 데드캣 바운스로 보고 매수를 보류하세요.")
+        _m = info.get('mtf') or {}
+        st.error("🚫 Bullish CHoCH가 나왔지만 " + ("200일선 아래에서 200일선이 아직 내려가는 중입니다."
+                 if _m.get('kind') == "SMA" else "상위 프레임이 하락 추세입니다.") + " 데드캣 바운스로 보고 매수를 보류하세요.")
     elif ph == "분배":
         st.error("🟣 분배 국면입니다. 신규 매수를 금지하고 보유분은 분할 매도를 검토하세요.")
-        st.markdown("**[3분할 매도 타점]**")
+        st.markdown("**[매도 참고 가격대 (피보나치)]**")
         st.markdown(f"- {sell_line}")
     elif ph == "상승":
         st.markdown("**[눌림목 참고 계획]** (CHoCH 트리거 없는 기존 상승 추세 · 비중 보수적)")
         plan = build_trade_plan(info)
         if plan:
-            _render_plan(plan, rate, "눌림목 진입 시 예상 계획")
-        st.markdown("**[3분할 매도 타점]** (고점권 접근 시 분할 매도 준비)")
+            _render_plan(plan, rate, "눌림목 참고 계획 (매수 신호 아님)")
+        st.markdown("**[매도 참고 가격대 (피보나치)]** (고점권 접근 시 💼 포지션 관리 탭으로 확인)")
         st.markdown(f"- {sell_line}")
     elif ph == "매집":
         st.info("🔵 매집 정황은 있으나 CHoCH 트리거 전입니다. 종가가 IBSL을 돌파·안착할 때까지 매수를 보류하고 관찰하세요.")
@@ -1148,7 +1199,7 @@ def render_trade_guide(info, fibs, curr, rate):
                "손절·익절 가격은 현재가 기준으로 계산됩니다.")
     st.caption("※ 규칙 기반 참고 지표이며 수익을 보장하지 않습니다. 투자 판단과 책임은 본인에게 있습니다.")
 
-def build_chart(df, fibs, rate=1.0, history=None, info=None, plan=None):
+def build_chart(df, fibs, rate=1.0, history=None, info=None, plan=None, extra_lines=None, zones=None):
     fig = make_subplots(rows=2, cols=1, shared_xaxes=True, row_heights=[0.75, 0.25], vertical_spacing=0.03)
     if history:
         for x0, x1, ph in history:
@@ -1184,36 +1235,933 @@ def build_chart(df, fibs, rate=1.0, history=None, info=None, plan=None):
     if plan is not None:
         fig.add_hline(y=plan['sl'] * rate, line_dash="dot", line_color="#ef5350", line_width=2,
                       annotation_text="SL 손절", annotation_position="right", row=1, col=1)
-        fig.add_hline(y=plan['tp1'] * rate, line_dash="dot", line_color="#26a69a", line_width=2,
-                      annotation_text="TP1 익절", annotation_position="right", row=1, col=1)
+        tp_y = plan.get('tp_struct', plan['tp1'])
+        fig.add_hline(y=tp_y * rate, line_dash="dot", line_color="#26a69a", line_width=2,
+                      annotation_text="1차 익절(50%)", annotation_position="right", row=1, col=1)
+    # --- ICT 수요 구간 (주봉 오더블록·FVG) ---
+    for z in (zones or []):
+        fig.add_hrect(y0=z['lo'] * rate, y1=z['hi'] * rate, fillcolor="#26a69a", opacity=0.12, line_width=0,
+                      annotation_text=z['kind'], annotation_position="top left", row=1, col=1)
+    # --- 추가 가로선 (매도 계산기: 평단가·트레일링 스탑 등) ---
+    for y, label, color in (extra_lines or []):
+        if y is not None and np.isfinite(y):
+            fig.add_hline(y=y * rate, line_dash="dashdot", line_color=color, line_width=2,
+                          annotation_text=label, annotation_position="right", row=1, col=1)
 
     colors = ['#26a69a' if r['close'] >= r['open'] else '#ef5350' for _, r in df.iterrows()]
     fig.add_trace(go.Bar(x=df['time'], y=df['volume'], marker_color=colors, name='Volume'), row=2, col=1)
     fig.update_layout(height=600, margin=dict(l=0, r=0, t=0, b=0), xaxis_rangeslider_visible=False)
     return fig
 
+# ==========================================
+# 결론 판정 (상세 화면·스크리너 공용): 🔴 절대 매수 금지 / ⏳ 관심 종목·관망 / 🟢 매수 실행
+# ==========================================
+VERDICT_STYLE = {
+    "NO":   dict(title="🔴 절대 매수 금지", bg="#c62828"),
+    "WAIT": dict(title="⏳ 관심 종목 / 관망", bg="#ef8f00"),
+    "BUY":  dict(title="🟢 매수 실행", bg="#2e7d32"),
+}
+
+
+def action_verdict(info, plan=None):
+    """기존 엔진 상태(entry·phase·MTF) → 초보자용 3단 결론. 🟢는 '바닥 셋업 후 돌파 확정(TRIGGER)'일 때만."""
+    entry, ph = info.get('entry'), info.get('phase')
+    smc = info.get('smc') or {}
+    mtf = info.get('mtf') or {}
+    trig = smc.get('trigger_level')
+
+    def v(kind, *reasons, trigger=None):
+        return dict(kind=kind, reasons=list(reasons), trigger=trigger)
+
+    if entry == "WHIPSAW":
+        return v("NO", "가짜 반등(휩쏘): 종가가 직전 저점(ISSL) 아래로 떨어졌습니다.", "다음 바닥 셋업이 나올 때까지 사지 않습니다.")
+    if entry == "DOWN":
+        return v("NO", "하락 구조 진행 중: 종가가 직전 저점 아래에 있습니다.", "떨어지는 칼날 구간입니다. 현금을 유지하세요.")
+    if entry == "BLOCKED":
+        return v("NO", "200일선 아래에서, 200일선이 아직 내려가는 중에 나온 반등입니다 (데드캣 경계).",
+                 "200일선 하락이 멈추거나 가격이 200일선을 되찾을 때까지 기다립니다.")
+    if entry == "TRIGGER":
+        if info.get('extended'):
+            return v("WAIT", "바닥 셋업 후 돌파는 확정됐지만 이미 많이 올랐습니다 (추격 구간).",
+                     "돌파선 근처로 되돌림(리테스트)이 오면 아래 플랜의 2차 가격에서 삽니다.",
+                     trigger=(smc.get('choch') or {}).get('level'))
+        if plan and plan.get('blocked'):
+            return v("WAIT", "바닥 셋업 후 돌파는 확정됐지만 손익비가 기준에 못 미칩니다.", plan['blocked'])
+        return v("BUY", "바닥 셋업 → 돌파(Bullish CHoCH) 확정: 무릎 매수 조건을 모두 충족했습니다.",
+                 "아래 플랜대로 1차를 지금 사고, 체결 즉시 공통 손절가에 스탑 주문을 걸어 두세요.")
+    if entry == "BREAKOUT":
+        return v("WAIT", "돌파는 했지만 그 전에 바닥 셋업이 없었습니다 — 무릎이 아니라 단순 추세 돌파입니다.",
+                 "이 전략에서는 사지 않고 관망합니다. 다음 바닥 셋업을 기다리세요.")
+    if entry == "PENDING":
+        return v("WAIT", "돌파 직후입니다. 종가 안착(2봉 연속 돌파선 위)을 확인하는 중입니다.",
+                 "안착이 확인되면 🟢 매수 실행으로 바뀝니다. 미리 사지 마세요.", trigger=trig)
+    if entry == "SETUP":
+        return v("WAIT", "바닥 셋업이 성립했습니다 → 관심 종목에 넣으세요. 아직 매수 신호가 아닙니다.",
+                 "종가가 트리거 가격 위로 돌파·안착하면 🟢 매수 실행으로 바뀝니다.", trigger=trig)
+    if ph == "하락" or mtf.get('state') == "bear":
+        return v("NO", "하락 추세(역배열)입니다.", "구조 반전과 바닥 셋업이 나오기 전까지 현금을 유지합니다.", trigger=trig)
+    if ph == "분배":
+        return v("NO", "분배(고점권) 국면입니다. 신규 매수 금지.", "보유 중이면 💼 포지션 관리 탭에서 청산 계획을 확인하세요.")
+    if ph == "매집":
+        return v("WAIT", "매집 정황은 있지만 바닥 셋업·돌파 전입니다.", "관심 종목에 두고 셋업 성립과 트리거 돌파를 기다립니다.", trigger=trig)
+    return v("WAIT", "상승 추세 진행 중이지만 새 매수 신호는 없습니다.", "추격하지 말고 다음 바닥 셋업이나 돌파선 리테스트를 기다립니다.", trigger=trig)
+
+
+# ==========================================
+# 2분할 진입 플랜 (1차 50% 돌파 확정 · 2차 50% 돌파선 리테스트 · 공통 손절 1개 · 1% 룰)
+# ==========================================
+SPLIT_COST = 0.0015            # 편도 수수료+슬리피지 가정 (손실 계산에 포함)
+
+
+def _qty_floor(q, qty_dec):
+    if qty_dec is None:
+        return q
+    f = 10 ** qty_dec
+    return math.floor(q * f) / f
+
+
+def entry_plan_2split(info, curr, equity, rate=1.0, qty_dec=0, override=None):
+    """
+    기본 플랜
+      1차 50% : 돌파 확정 가격 (이미 확정이면 현재가, 아직이면 트리거 가격)
+      2차 50% : 돌파선(IBSL) 리테스트 가격 — 돌파 후 되돌림에서 지지 확인 시
+      손절    : 2차 가격 기준 구조적 손절 (직전 저점 아래 또는 1.5 ATR, 최소 0.8 ATR) — 두 차수 공통
+      총액    : 두 차수 모두 체결 후 손절되면 총자산 × (1% × 신뢰도 보정) 만큼만 잃도록 역산, 한 종목 최대 30%
+    가격은 원 단위(표시 통화)로 계산해 반환. 계산 불가면 None.
+    """
+    L, smc = info['levels'], info['smc']
+    atr = L.get('atr_abs')
+    if not atr or atr <= 0 or not curr:
+        return None
+    entry = info.get('entry')
+    choch_lv = (smc.get('choch') or {}).get('level')
+    if entry in ("TRIGGER", "BREAKOUT", "PENDING") and choch_lv:
+        p1, base, stage1 = float(curr), float(choch_lv), "now"          # 이미 돌파: 1차는 지금, 2차는 돌파한 선 리테스트
+    elif smc.get('trigger_level') and L.get('ibsl'):
+        p1, base, stage1 = float(smc['trigger_level']), float(L['ibsl']), "trigger"
+    else:
+        return None
+    p2 = base if base < p1 else p1 - 0.5 * atr
+    ref = build_trade_plan(info, entry=p2, assume_trigger=True)
+    ref1 = build_trade_plan(info, entry=p1, assume_trigger=(entry != "TRIGGER"))
+    if not ref or not ref1:
+        return None
+    sl = ref['sl']
+    if override:
+        p1 = override.get('p1', p1 * rate) / rate
+        p2 = override.get('p2', p2 * rate) / rate
+        sl = override.get('sl', sl * rate) / rate
+    conf = max(0.1, float(ref1.get('conf', 1.0)))
+    risk_eff = RISK_PER_TRADE * conf
+    P1, P2, SL = p1 * rate, p2 * rate, sl * rate
+    if not (P1 > SL and P2 > SL):
+        return dict(err="매수가가 손절가보다 낮거나 같습니다. 손절가 아래에서는 사지 않습니다.", p1=P1, p2=P2, sl=SL)
+    loss = [(p * (1 + SPLIT_COST) - SL * (1 - SPLIT_COST)) / p for p in (P1, P2)]      # 금액 1원당 손절 시 손실 비율
+    total = equity * risk_eff / 100 / (0.5 * loss[0] + 0.5 * loss[1])
+    capped = total > equity * MAX_POSITION_PCT / 100
+    total = min(total, equity * MAX_POSITION_PCT / 100)
+    rows, cum_loss = [], 0.0
+    for n, (p, lf) in enumerate(zip((P1, P2), loss), start=1):
+        q = _qty_floor(total * 0.5 / p, qty_dec)
+        amt = q * p
+        cum_loss += amt * lf
+        rows.append(dict(n=n, price=p, qty=q, amount=amt, cum_loss=cum_loss, cum_loss_pct=cum_loss / equity * 100))
+    return dict(err=None, p1=P1, p2=P2, sl=SL, sl_pct=(SL / P1 - 1) * 100, rows=rows, stage1=stage1,
+                total=sum(r['amount'] for r in rows), risk_eff=risk_eff, notes=ref1.get('notes', []), capped=capped,
+                tp_struct=ref1['tp_struct'] * rate, tp_struct_label=ref1['tp_struct_label'],
+                chase=(P2 < (base - 0.5 * atr) * rate))
+
+
+def _won(v, small=False):
+    return "-" if v is None else (f"₩{v:,.2f}" if small else f"₩{v:,.0f}")
+
+
+def _qty_txt(q, qty_dec):
+    if qty_dec == 0:
+        return f"{int(q):,}주"
+    return f"{q:,.{qty_dec}f}개" if qty_dec else f"{q:,.4f}"
+
+
+def render_action_banner(v, plan2, info, curr, rate, qty_dec, equity):
+    """대시보드 최상단: 지금 해야 할 행동 1개 + 숫자 (가격·수량·손절)"""
+    sty = VERDICT_STYLE[v['kind']]
+    st.markdown(
+        f"""<div style="background:{sty['bg']};color:#fff;padding:16px 20px;border-radius:12px;margin:2px 0 10px 0">
+<div style="font-size:28px;font-weight:800;line-height:1.25">{sty['title']}</div>
+<div style="font-size:15px;opacity:.95;margin-top:6px">{'<br>'.join(v['reasons'])}</div></div>""",
+        unsafe_allow_html=True)
+    small = curr * rate < 1000
+    m1, m2, m3, m4 = st.columns(4)
+    ok_plan = plan2 is not None and not plan2.get('err')
+    if v['kind'] == "BUY" and ok_plan:
+        r1, r2 = plan2['rows']
+        m1.metric("① 1차 매수 (지금)", _won(r1['price'], small), _qty_txt(r1['qty'], qty_dec), delta_color="off")
+        m2.metric("② 2차 매수 (리테스트)", _won(r2['price'], small), _qty_txt(r2['qty'], qty_dec), delta_color="off")
+        m3.metric("③ 공통 손절가", _won(plan2['sl'], small), f"{plan2['sl_pct']:+.1f}%", delta_color="off")
+        m4.metric("④ 총 매수 금액", _won(plan2['total']), f"총자산의 {plan2['total'] / equity * 100:.1f}%", delta_color="off")
+    elif v['kind'] == "WAIT" and v.get('trigger') and ok_plan:
+        m1.metric("① 트리거 가격 (종가 기준)", _won(v['trigger'] * rate, small), f"현재가 대비 {(v['trigger'] / curr - 1) * 100:+.1f}%", delta_color="off")
+        m2.metric("② 돌파 시 손절가", _won(plan2['sl'], small), f"{plan2['sl_pct']:+.1f}%", delta_color="off")
+        m3.metric("③ 돌파 시 총 매수 금액", _won(plan2['total']), f"총자산의 {plan2['total'] / equity * 100:.1f}%", delta_color="off")
+        m4.metric("④ 지금 권장 비중", "0%")
+    else:
+        mtf = info.get('mtf') or {}
+        L = info.get('levels') or {}
+        m1.metric("① 지금 권장 비중", "0%")
+        m2.metric("② 200일선", _won(mtf['sma'] * rate, small) if mtf.get('sma') else "N/A",
+                  f"현재가 대비 {(mtf['sma'] / curr - 1) * 100:+.1f}%" if mtf.get('sma') else None, delta_color="off")
+        m3.metric("③ 직전 저점 (ISSL)", _won(L['issl'] * rate, small) if L.get('issl') else "N/A")
+        m4.metric("④ 트리거 가격", _won(v['trigger'] * rate, small) if v.get('trigger') else "N/A")
+    st.caption("⚠️ 3박자·매집 점수는 **관심 종목 편입 기준**일 뿐입니다. 실제 매수는 이 결론이 **🟢 매수 실행**(바닥 셋업 후 돌파 확정)일 때만 하세요.")
+
+
+def render_entry_plan(v, plan2, info, curr, rate, qty_dec, equity):
+    """🧮 2분할 진입 플랜: 그대로 따라 할 주문표 + 가격 직접 수정"""
+    expanded = v['kind'] == "BUY"
+    with st.expander("🧮 2분할 진입 플랜 (1차 50% 돌파 확정 · 2차 50% 리테스트 · 공통 손절 · 1% 룰)", expanded=expanded):
+        if plan2 is None:
+            st.caption("돌파 기준선(IBSL)이나 ATR을 계산할 수 없어 플랜을 만들 수 없습니다.")
+            return
+        small = curr * rate < 1000
+        if st.checkbox("가격 직접 수정", value=False, key=f"ep_edit_{info.get('bars')}"):
+            e1, e2, e3 = st.columns(3)
+            fmt_in = "%.2f" if small else "%.0f"
+            o = dict(p1=e1.number_input("1차 매수가", min_value=0.0, value=float(round(plan2['p1'], 2)), format=fmt_in),
+                     p2=e2.number_input("2차 매수가", min_value=0.0, value=float(round(plan2['p2'], 2)), format=fmt_in),
+                     sl=e3.number_input("공통 손절가", min_value=0.0, value=float(round(plan2['sl'], 2)), format=fmt_in))
+            o = {k: val for k, val in o.items() if isinstance(val, (int, float))}
+            plan2 = entry_plan_2split(info, curr, equity, rate, qty_dec, override=o) or plan2
+        if plan2.get('err'):
+            st.error(plan2['err'])
+            return
+        r1, r2 = plan2['rows']
+        when1 = "지금 (돌파 확정됨)" if plan2['stage1'] == "now" else "종가가 트리거 가격 위로 마감·안착한 다음 날"
+        tbl = pd.DataFrame([
+            {"차수": "1차 (50%)", "언제": when1, "가격": _won(r1['price'], small), "수량": _qty_txt(r1['qty'], qty_dec),
+             "금액": _won(r1['amount']), "여기까지 산 뒤 손절 시 손실": f"{_won(r1['cum_loss'])} ({r1['cum_loss_pct']:.2f}%)"},
+            {"차수": "2차 (50%)", "언제": "돌파선까지 되돌림 후 지지 확인 시 (지정가)", "가격": _won(r2['price'], small),
+             "수량": _qty_txt(r2['qty'], qty_dec), "금액": _won(r2['amount']),
+             "여기까지 산 뒤 손절 시 손실": f"{_won(r2['cum_loss'])} ({r2['cum_loss_pct']:.2f}%)"},
+            {"차수": "🛑 손절", "언제": "1차 체결 즉시 스탑(감시) 주문 · 두 차수 공통", "가격": _won(plan2['sl'], small),
+             "수량": "전량", "금액": "-", "여기까지 산 뒤 손절 시 손실": "-"},
+        ])
+        st.dataframe(tbl, hide_index=True)
+        st.markdown(f"- 총 매수 금액: **{_won(plan2['total'])}** (총자산의 {plan2['total'] / equity * 100:.1f}%) · "
+                    f"적용 리스크 {plan2['risk_eff']:.2f}%"
+                    + (f" ({', '.join(plan2['notes'])})" if plan2['notes'] else ""))
+        st.markdown(f"- 청산: 1차 50%는 **{_won(plan2['tp_struct'], small)}** ({plan2['tp_struct_label']})에서 익절, "
+                    "잔여 50%는 트레일링 스탑(고점 − 3 ATR) — 💼 포지션 관리 탭에서 매일 확인")
+        if plan2['capped']:
+            st.warning(f"손절폭이 좁아 계산된 금액이 한 종목 최대 비중({MAX_POSITION_PCT:g}%)을 넘어서 {MAX_POSITION_PCT:g}%로 제한했습니다.")
+        if plan2['chase']:
+            st.warning("⚠️ 2차 가격이 돌파선보다 한참 아래입니다. 이건 리테스트가 아니라 하락 중 물타기입니다. 가격을 다시 확인하세요.")
+        if any(r['qty'] == 0 for r in plan2['rows']):
+            st.warning("한 차수의 수량이 0입니다 (1주 가격이 배정 금액보다 큼). 이 종목은 1회 진입으로 나누거나 매수하지 않는 편이 맞습니다.")
+        if v['kind'] != "BUY":
+            st.info("지금은 🟢 매수 실행 상태가 아니므로, 이 표는 **조건이 충족됐을 때의 예약 계획**입니다. 지금 주문하지 마세요.")
+        st.caption(f"※ 손실에는 편도 {SPLIT_COST * 100:.2f}%의 수수료·슬리피지를 포함했습니다. 총자산은 사이드바에서 바꿀 수 있습니다.")
+
+
+
+# ==========================================
+# ICT 분석 (주봉 구간·방향 + 일봉 진입) — 마감 확정 봉만 사용, 미래 참조 없음
+#   주봉: 수요 구간(Order Block · FVG), 딜링 레인지(할인/프리미엄 · OTE), 스윙 구조(HH/HL)
+#   일봉: ① 유동성 스윕 후 회복 → ② CHoCH 확정 → ③ 돌파선 리테스트  (3단 분할 매수 사다리)
+# ==========================================
+ICT_W_PIV = 2             # 주봉 스윙 고점·저점 확정에 필요한 좌우 봉 수
+ICT_RANGE_W = 52          # 딜링 레인지 기간 (주)
+ICT_DISP_ATR = 1.2        # 변위(강한 양봉) 기준: 몸통 ≥ 주봉 ATR × 1.2, 직전 5주 고점 돌파
+ICT_OB_LOOK = 3           # 변위 직전 몇 주 안의 마지막 음봉을 오더블록으로 볼지
+ICT_MAX_ZONES = 4         # 화면에 보여 줄 수요 구간 최대 개수
+ICT_ZONE_TOL_ATR = 1.0    # 수요 구간 '도달'로 볼 거리 (일봉 ATR 배수)
+ICT_SWEEP_N = 10          # 1차(스윕 후 회복) 매수가 유효한 기간 (일봉)
+ICT_SWEEP_MEM = 40        # CHoCH·리테스트 단계에서 인정할 스윕의 최대 경과 봉수
+ICT_LIQ_N = 20            # 스윕 대상 유동성: 직전 20봉 최저가 (또는 현재가 아래 확정 저점)
+ICT_FRACTAL = 2           # CHoCH 기준 반등 고점: 좌우 2봉 프랙털
+ICT_DISCOUNT_SWEEP = 0.0  # 수요 구간이 없어도 스윕을 인정할 레인지 위치 (0 = 수요 구간 근처 스윕만 인정, 예: 0.15 = 하위 15%)
+ICT_RETEST_N = 5          # 3차(리테스트) 매수가 유효한 기간 (일봉)
+ICT_RETEST_ATR = 0.5      # 돌파선 ± 이 배수(ATR) 안으로 되돌아오면 리테스트
+ICT_STOP_BUF_ATR = 0.25   # 무효화 손절 = 스윕 저점 − 0.25 ATR
+ICT_LADDER = (0.3, 0.3, 0.4)   # 1차 스윕 후 회복 / 2차 CHoCH / 3차 리테스트
+WEEKLY_DOWN_RISK_MULT = 0.5   # 주봉 하락 추세(주봉 CHoCH 전)일 때 일봉 매수 리스크 배수 (0으로 바꾸면 이 구간 매수 차단)
+WEEKLY_SWEEP_RISK_MULT = 0.75 # 주봉 저점 스윕 후 회복(추세 전환 초기)일 때 리스크 배수
+W_SWEEP_N = 8                 # 주봉 스윕을 인정할 최근 주 수
+ICT_WEAK_FILTER_MULT = 0.75   # 보조 필터 충족이 2개 미만이면 리스크 배수
+
+
+def to_weekly(d):
+    """일봉(마감 봉) → 주봉. 마지막 주는 아직 진행 중일 수 있어 제외 (추가 API 호출 없음)"""
+    x = d[['time', 'open', 'high', 'low', 'close', 'volume']].copy()
+    x['time'] = pd.to_datetime(x['time'])
+    w = (x.set_index('time').resample('W-MON', label='left', closed='left')
+         .agg({'open': 'first', 'high': 'max', 'low': 'min', 'close': 'last', 'volume': 'sum'})
+         .dropna(subset=['close']).reset_index())
+    return w.iloc[:-1].reset_index(drop=True) if len(w) > 1 else w
+
+
+def _weekly_zones(w):
+    """주봉 수요 구간: ① 오더블록(강한 상승 변위 직전의 마지막 음봉) ② 상승 FVG(3봉 가격 공백). 이후 주봉 종가가 아래로 깨면 무효."""
+    if len(w) < 12:
+        return [], None
+    o, h, l, c = (w[k].to_numpy(dtype=float) for k in ('open', 'high', 'low', 'close'))
+    pc = np.r_[c[0], c[:-1]]
+    tr = np.maximum(h - l, np.maximum(abs(h - pc), abs(l - pc)))
+    atr_w = pd.Series(tr).rolling(10, min_periods=5).mean().to_numpy()
+    tm = pd.to_datetime(w['time']).to_numpy()
+    zones = []
+    for i in range(6, len(w)):
+        if not np.isfinite(atr_w[i]):
+            continue
+        if c[i] - o[i] >= ICT_DISP_ATR * atr_w[i] and c[i] > h[i - 5:i].max():
+            j = next((k for k in range(i - 1, max(i - 1 - ICT_OB_LOOK, -1), -1) if c[k] < o[k]), None)
+            if j is not None:
+                zones.append(dict(kind="주봉 오더블록", lo=float(l[j]), hi=float(max(o[j], c[j])), i=i, t=tm[j],
+                                  known=tm[i] + np.timedelta64(7, 'D')))
+        if i >= 2 and l[i] > h[i - 2] and (l[i] - h[i - 2]) >= 0.3 * atr_w[i] and c[i - 1] > o[i - 1]:
+            zones.append(dict(kind="주봉 FVG", lo=float(h[i - 2]), hi=float(l[i]), i=i, t=tm[i - 1],
+                              known=tm[i] + np.timedelta64(7, 'D')))
+    valid = []
+    for z in zones:
+        after = c[z['i'] + 1:]
+        if not (after < z['lo']).any():          # 주봉 종가가 구간 아래로 마감한 적이 없어야 유효
+            valid.append(z)
+    valid.sort(key=lambda z: z['hi'], reverse=True)
+    merged = []                                   # 겹치는 구간은 하나로
+    for z in valid:
+        if merged and z['hi'] >= merged[-1]['lo'] and z['lo'] <= merged[-1]['hi']:
+            m = merged[-1]
+            m.update(lo=min(m['lo'], z['lo']), hi=max(m['hi'], z['hi']), known=min(m['known'], z['known']),
+                     kind=m['kind'] if m['kind'] == z['kind'] else "주봉 OB+FVG")
+        else:
+            merged.append(dict(z))
+    return merged, (float(atr_w[-1]) if np.isfinite(atr_w[-1]) else None)
+
+
+def _weekly_structure(w, k=ICT_W_PIV):
+    """주봉 확정 스윙으로 방향 판단: HH+HL = 상승, LH+LL = 하락, 그 외 = 전환·횡보"""
+    h, l = w['high'].to_numpy(dtype=float), w['low'].to_numpy(dtype=float)
+    n = len(w)
+    ph = [i for i in range(k, n - k) if h[i] == h[i - k:i + k + 1].max()]
+    pl = [i for i in range(k, n - k) if l[i] == l[i - k:i + k + 1].min()]
+    if len(ph) < 2 or len(pl) < 2:
+        return dict(bias="판단 불가", hh=None, hl=None)
+    hh, hl = h[ph[-1]] > h[ph[-2]], l[pl[-1]] > l[pl[-2]]
+    bias = "상승" if (hh and hl) else "하락" if (not hh and not hl) else "전환·횡보"
+    return dict(bias=bias, hh=bool(hh), hl=bool(hl), last_ph=float(h[ph[-1]]), last_pl=float(l[pl[-1]]))
+
+
+W_STATE_META = {
+    "W_UP":    dict(label="상승 추세 (주봉 HH·HL)", short="상승", icon="🟢"),
+    "W_CHOCH": dict(label="추세 전환 시도 (주봉 CHoCH)", short="전환 시도", icon="🔵"),
+    "W_SWEEP": dict(label="하락 추세 · 주봉 저점 스윕 후 회복 (전환 초기 신호)", short="하락·스윕", icon="🟡"),
+    "W_DOWN":  dict(label="하락 추세 진행 중 (주봉 CHoCH 전)", short="하락", icon="🔴"),
+    "W_RANGE": dict(label="횡보·방향 불분명", short="횡보", icon="⚪"),
+    "W_NA":    dict(label="판단 불가 (주봉 데이터 부족)", short="-", icon="⚪"),
+}
+
+
+def weekly_ict(w, px):
+    """
+    주봉 ICT로 장기 추세 판정 (완성된 주봉만 사용).
+      W_UP    : 최근 확정 스윙 고점·저점이 모두 상승 (HH·HL) — 상승 추세
+      W_CHOCH : 하락 구조의 마지막 반등 고점(Lower High)을 주봉 종가로 돌파 — 추세 전환 시도
+      W_SWEEP : 하락 구조에서 최근 주봉이 직전 스윙 저점을 쓸고 종가 회복 — 전환 초기 신호(아직 CHoCH 전)
+      W_DOWN  : 하락 구조 진행 중 (CHoCH 전)
+      W_RANGE : 그 외
+    level = 주봉 CHoCH 기준선(마지막 Lower High), dist = 현재가 대비 거리
+    """
+    out = dict(state="W_NA", level=None, dist=None, sweep=None, choch_time=None, mult=1.0)
+    n = len(w)
+    if n < 16:
+        return out
+    h, l, c = (w[k].to_numpy(dtype=float) for k in ('high', 'low', 'close'))
+    tm = pd.to_datetime(w['time']).to_numpy()
+    pc = np.r_[c[0], c[:-1]]
+    atr_w = pd.Series(np.maximum(h - l, np.maximum(abs(h - pc), abs(l - pc)))).rolling(10, min_periods=5).mean().to_numpy()
+    k = ICT_W_PIV
+    fh = [i for i in range(k, n - k) if h[i] == h[i - k:i + k + 1].max()]
+    fl = [i for i in range(k, n - k) if l[i] == l[i - k:i + k + 1].min()]
+    if len(fh) < 2 or len(fl) < 2:
+        return out
+    hh, hl = h[fh[-1]] > h[fh[-2]], l[fl[-1]] > l[fl[-2]]
+    bos_down = px < l[fl[-1]]                       # 마지막 확정 스윙 저점 아래 → 하락 BOS
+    # 마지막 상승 구간(직전 스윙 저점 → 마지막 스윙 고점)의 50% 아래로 되밀림 → 그 상승 추세는 무너진 것으로 봄
+    lows_before = [i for i in fl if i < fh[-1]]
+    leg_lo = l[lows_before[-1]] if lows_before else l[:fh[-1] + 1].min()
+    deep_retrace = px < leg_lo + 0.5 * (h[fh[-1]] - leg_lo)
+    down = (not hh) or bos_down or deep_retrace
+    # 전환 기준선: 마지막 스윙 고점이 낮아진 고점(LH)이면 그것, 고점에서 쉬지 않고 빠져 LH가 아직 없으면 최근 10주 최고가
+    lh_idx = next((fh[j] for j in range(len(fh) - 1, 0, -1) if h[fh[j]] < h[fh[j - 1]] and fh[j] >= fh[-1]), None)
+    if lh_idx is not None:
+        lv, src, base_i = float(h[lh_idx]), "마지막 반등 고점(LH)", lh_idx
+    elif down:
+        # 마지막 스윙 고점 이후의 최저 주봉(바닥)을 찾고, 그 직전 10주 안의 최고가를 기준선으로 고정 (반등을 따라 움직이지 않음)
+        top = fh[-1]
+        bot = top + 1 + int(np.argmin(l[top + 1:])) if top + 1 < n else n - 1
+        lo_w = max(top + 1, bot - 10)
+        base_i = lo_w + int(np.argmax(h[lo_w:bot])) if bot > lo_w else top
+        lv, src = float(h[base_i]), "바닥 직전 반등 고점"
+    else:
+        lv, src, base_i = None, None, None
+    choch = None
+    if lv is not None:
+        out.update(level=lv, dist=lv / px - 1, level_src=src)
+        j = next((i for i in range(base_i + 1, n) if c[i] > lv), None)
+        if j is not None:
+            choch = j
+            out['choch_time'] = tm[j]
+    # 주봉 스윕: 최근 W_SWEEP_N주 안에 직전 확정 스윙 저점 − 0.25 ATR 아래를 찍고, 2주 안에 그 위로 종가 회복
+    sweep = None
+    for t in range(n - 1, max(n - 1 - W_SWEEP_N, k), -1):
+        prior = [l[i] for i in fl if i + k < t]
+        if not prior or not np.isfinite(atr_w[t]):
+            continue
+        lv = prior[-1]
+        if l[t] < lv - 0.25 * atr_w[t]:
+            r = next((r for r in range(t, min(t + 2, n)) if c[r] > lv), None)
+            if r is not None:
+                sweep = dict(time=tm[t], level=float(lv), low=float(l[t]))
+                break
+    out['sweep'] = sweep
+    if hh and hl and not bos_down and not deep_retrace:
+        state = "W_UP"
+    elif choch is not None and c[-1] > out['level'] * 0.97:
+        state = "W_CHOCH"
+    elif down:
+        state = "W_SWEEP" if sweep else "W_DOWN"
+    else:
+        state = "W_RANGE"
+    out['state'] = state
+    out['mult'] = WEEKLY_DOWN_RISK_MULT if state == "W_DOWN" else WEEKLY_SWEEP_RISK_MULT if state == "W_SWEEP" else 1.0
+    return out
+
+
+def ict_analysis(df, info):
+    """
+    df   : add_indicators 결과 (마지막 봉은 진행 중일 수 있음 → 판정은 마감 봉만)
+    info : analyze_market_cycle 결과 (기존 CHoCH·셋업·레벨 재사용)
+    반환 : 단계(stage)와 근거, 사다리 계산용 가격
+      INVALID   스윕 저점 아래 종가 → 셋업 실패
+      RETEST    CHoCH 후 돌파선 되돌림 지지 → 3차
+      CHOCH     스윕(또는 바닥 셋업) 후 CHoCH 확정 → 2차
+      CHOCH_EXT CHoCH 후 이미 많이 오름 → 3차 리테스트 대기
+      POST      CHoCH 후 2차 시점 지남 → 3차 리테스트 대기
+      PENDING   CHoCH 돌파 직후 안착 확인 중
+      SWEEP     수요 구간·할인 구간에서 직전 저점을 쓸고 종가 회복 → 1차
+      IN_ZONE   주봉 수요 구간 도달, 스윕 대기
+      NO_ZONE   ICT 매수 맥락 없음
+    """
+    d = df.iloc[:-1] if len(df) > 1 else df
+    n = len(d)
+    out = dict(stage="NO_ZONE", zones=[], weekly={}, range=None, sweep=None, choch=None, retest=None,
+               filters={}, invalid=None, ok=False)
+    if n < 60 or 'ISSL' not in d.columns:
+        return out
+    lo, hi, cl = (d[k].to_numpy(dtype=float) for k in ('low', 'high', 'close'))
+    vol = d['volume'].to_numpy(dtype=float)
+    issl = d['ISSL'].to_numpy(dtype=float)
+    atr = d['ATR_ABS'].to_numpy(dtype=float) if 'ATR_ABS' in d.columns else np.full(n, np.nan)
+    tm = pd.to_datetime(d['time']).to_numpy()
+    atr_now = float(atr[-1]) if np.isfinite(atr[-1]) else float(np.nanmedian(atr[-20:]))
+    px = float(cl[-1])
+
+    # ---------- 주봉: 구간 · 레인지 · 방향 ----------
+    w = to_weekly(d)
+    zones, _atr_w = _weekly_zones(w)
+    wk = w.tail(ICT_RANGE_W)
+    rng = None
+    if len(wk) >= 8:
+        r_hi, r_lo = float(wk['high'].max()), float(wk['low'].min())
+        if r_hi > r_lo:
+            R = r_hi - r_lo
+            rng = dict(hi=r_hi, lo=r_lo, eq=r_lo + R / 2, pos=(px - r_lo) / R,
+                       ote_hi=r_hi - 0.62 * R, ote_lo=r_hi - 0.79 * R)
+    out.update(weekly=_weekly_structure(w) if len(w) >= 8 else dict(bias="판단 불가"), range=rng, wict=weekly_ict(w, px))
+    below = [z for z in zones if z['lo'] <= px + ICT_ZONE_TOL_ATR * atr_now]       # 현재가 아래(또는 걸친) 구간
+    out['zones'] = sorted(below, key=lambda z: z['hi'], reverse=True)[:ICT_MAX_ZONES]
+    near = [z for z in out['zones'] if z['lo'] - ICT_ZONE_TOL_ATR * atr_now <= px <= z['hi'] + ICT_ZONE_TOL_ATR * atr_now]
+
+    def in_context(t):
+        """봉 t의 저가가 (그때 이미 알려진) 수요 구간 근처이거나 주봉 할인 구간(50% 아래)인가"""
+        a = atr[t] if np.isfinite(atr[t]) else atr_now
+        for z in zones:
+            if z['known'] <= tm[t] and z['lo'] - ICT_ZONE_TOL_ATR * a <= lo[t] <= z['hi'] + ICT_ZONE_TOL_ATR * a:
+                return z['kind']
+        if ICT_DISCOUNT_SWEEP and rng and (lo[t] - rng['lo']) / (rng['hi'] - rng['lo']) < ICT_DISCOUNT_SWEEP:
+            return "주봉 깊은 할인 구간"
+        return None
+
+    # ---------- 일봉 ①: 유동성 스윕 후 회복 (가장 최근 것) ----------
+    # 유동성 = 그 봉 직전까지 '확정된' 스윙 저점 (좌우 2봉이 더 높았던 저점, 최근 20봉 안) 또는 직전 종가 아래의 확정 저점(ISSL)
+    #   · 저점 아래로 0.25 ATR 이상 찌르고, 3봉 안에 그 저점 + 0.1 ATR 위에서 종가 회복해야 스윕으로 인정 (하락 중 잔파동 배제)
+    kf = ICT_FRACTAL
+    is_fl = np.zeros(n, dtype=bool)
+    for i in range(kf, n - kf):
+        is_fl[i] = lo[i] == lo[i - kf:i + kf + 1].min()
+    sweep = None
+    for t in range(n - 1, max(n - 1 - ICT_SWEEP_MEM, ICT_LIQ_N), -1):
+        a = atr[t] if np.isfinite(atr[t]) else atr_now
+        cands = [float(lo[i]) for i in range(t - ICT_LIQ_N, t - kf) if is_fl[i]]          # t 시점에 확정된 프랙털 저점만
+        if np.isfinite(issl[t - 1]) and issl[t - 1] < cl[t - 1]:
+            cands.append(float(issl[t - 1]))
+        hit = sorted(c_ for c_ in cands if lo[t] < c_ - 0.25 * a)
+        if not hit:
+            continue
+        lvl, rec = None, None
+        for c_ in hit:                                   # 쓸린 저점 중 가장 깊은 것부터: 그 위로 3봉 안에 종가 회복하면 스윕
+            rec = next((r for r in range(t, min(t + 3, n)) if cl[r] > c_ + 0.1 * a), None)
+            if rec is not None:
+                lvl = c_
+                break
+        if rec is None:
+            continue
+        ctx = in_context(t)
+        if ctx is None:
+            continue
+        s_low = float(lo[t:rec + 1].min())
+        sweep = dict(idx=t, rec=rec, level=float(lvl), low=s_low, stop=s_low - ICT_STOP_BUF_ATR * a, ctx=ctx,
+                     time=tm[t], rec_close=float(cl[rec]), age=n - 1 - rec,
+                     vol_spike=bool(vol[t] >= 1.5 * np.nanmedian(vol[max(0, t - 20):t])) if t > 5 else False)
+        break
+    if sweep is not None:
+        after = cl[sweep['rec'] + 1:]
+        if (after < sweep['stop']).any():                                    # 스윕 저점 아래 종가 → 무효화
+            k = sweep['rec'] + 1 + int(np.argmax(after < sweep['stop']))
+            out['invalid'] = dict(time=tm[k], age=n - 1 - k, stop=sweep['stop'])
+            sweep = None
+    out['sweep'] = sweep
+
+    # ---------- 일봉 ②: CHoCH (스윕 이후, 또는 기존 엔진의 바닥 셋업 트리거) ----------
+    smc = info.get('smc') or {}
+    choch = None
+    if sweep is not None:
+        s0, k = sweep['idx'], ICT_FRACTAL
+        fh = [i for i in range(max(k, s0 - 30), s0 - k + 1) if hi[i] == hi[i - k:i + k + 1].max()]     # 스윕 시점에 확정된 반등 고점
+        lv = float(hi[fh[-1]]) if fh else float(hi[max(0, s0 - 10):s0].max())
+        a = atr[s0] if np.isfinite(atr[s0]) else atr_now
+        brk = [j for j in range(sweep['rec'], n) if cl[j] > lv + 0.1 * a]
+        if brk:
+            j = brk[0]
+            since = cl[j:]
+            choch = dict(idx=j, level=lv, age=n - 1 - j, bars_above=len(since), held=bool((since > lv).all()),
+                         time=tm[j], src="스윕 후 CHoCH")
+        sweep['choch_level'] = lv
+    if choch is None and info.get('entry') in ("TRIGGER", "PENDING") and smc.get('choch') and smc.get('setup_ctx'):
+        c0 = smc['choch']
+        j = n - 1 - c0['age']
+        choch = dict(idx=j, level=float(c0['level']), age=c0['age'], bars_above=c0['bars_above'], held=c0['held'],
+                     time=tm[j] if 0 <= j < n else None, src="바닥 셋업 후 CHoCH")
+    if choch is not None and not choch['held']:
+        choch = None                                                          # 돌파선 아래로 되밀리면 CHoCH 무효
+    out['choch'] = choch
+    if sweep is not None and choch is None and px <= sweep['level']:
+        out['sweep_failing'] = sweep
+        sweep = None
+        out['sweep'] = None
+
+    # ---------- 일봉 ③: 돌파선 리테스트 ----------
+    retest = None
+    if choch and choch['bars_above'] >= CHOCH_SETTLE:
+        lv, a = choch['level'], atr_now
+        for t in range(n - 1, max(choch['idx'] + 1, n - 1 - ICT_RETEST_N), -1):
+            if lo[t] <= lv + ICT_RETEST_ATR * a and cl[t] >= lv - ICT_RETEST_ATR * a:
+                retest = dict(idx=t, time=tm[t], level=lv, age=n - 1 - t)
+                break
+        if retest and px < lv - ICT_RETEST_ATR * a:
+            retest = None
+    out['retest'] = retest
+
+    # ---------- 보조 필터 (점수 합산이 아니라 '확인용' 체크) ----------
+    win = d.tail(20)
+    anyc = lambda col: bool(col in win.columns and win[col].fillna(False).astype(bool).any())
+    out['filters'] = {
+        "RSI 강세 다이버전스": anyc('BULL_DIV_RSI'),
+        "MACD 강세 다이버전스": anyc('BULL_DIV_MACD'),
+        "OBV 강세 (가격 대비 거래량 유입)": anyc('BULL_OBV'),
+        "스윕 시 거래량 급증 (투매 흔적)": bool(sweep and sweep['vol_spike']),
+        "일봉 저점 상승 (HL)": bool('HL_STATE' in d.columns and bool(d['HL_STATE'].iloc[-1])),
+        "변동성 수축 (횡보 다지기)": anyc('CONSOLIDATING'),
+        "주봉 할인 구간 (레인지 50% 아래)": bool(rng and rng['pos'] < 0.5),
+    }
+
+    # ---------- 단계 결정 ----------
+    ext = bool(choch and (px - choch['level']) > CHOCH_EXT_ATR * atr_now)
+    if out['invalid'] and out['invalid']['age'] <= ICT_SWEEP_N and not choch and px < out['invalid']['stop']:
+        stage = "INVALID"
+    elif choch and choch['bars_above'] < CHOCH_SETTLE:
+        stage = "PENDING"
+    elif choch and retest:
+        stage = "RETEST"
+    elif choch and ext:
+        stage = "CHOCH_EXT"
+    elif choch and choch['age'] <= CHOCH_WINDOW:
+        stage = "CHOCH"
+    elif choch:
+        stage = "POST"
+    elif sweep and sweep['age'] <= ICT_SWEEP_N and px > sweep['level']:
+        stage = "SWEEP"
+    elif near:
+        stage = "IN_ZONE"
+    else:
+        stage = "NO_ZONE"
+    liq_c = [float(lo[n - ICT_LIQ_N:n].min())] + ([float(issl[-1])] if np.isfinite(issl[-1]) and issl[-1] < px else [])
+    out.update(stage=stage, near=near, ext=ext, px=px, atr=atr_now, ok=True, liq=max(liq_c))
+    return out
+
+
+ICT_STAGE_LABEL = {
+    "SWEEP": "🟢 1차: 스윕 후 회복", "CHOCH": "🟢 2차: CHoCH 확정", "RETEST": "🟢 3차: 리테스트",
+    "PENDING": "⏳ CHoCH 안착 대기", "CHOCH_EXT": "⏳ 3차 리테스트 대기", "POST": "⏳ 3차 리테스트 대기",
+    "IN_ZONE": "🎯 수요 구간 도달", "INVALID": "🪤 무효화(스윕 실패)",
+}
+
+
+def ict_verdict(info, ict, plan_trig=None):
+    """ICT 단계를 우선으로 한 3단 결론. ICT 맥락이 없으면 기존 판정을 쓰되 🟢는 내지 않음 (ICT가 메인)."""
+    stg = ict.get('stage') if ict else "NO_ZONE"
+    wi = (ict or {}).get('wict') or {}
+    wst = wi.get('state', "W_NA")
+    blocked = wst == "W_DOWN" and WEEKLY_DOWN_RISK_MULT <= 0
+
+    def v(kind, tranche, *reasons, trigger=None):
+        rs = list(reasons)
+        if kind == "BUY" and wst == "W_DOWN":
+            rs.append(f"⚠️ 주봉은 아직 하락 추세(주봉 CHoCH 전)라 단기 반등일 수 있습니다 → 리스크 ×{WEEKLY_DOWN_RISK_MULT:g}"
+                      + (f" · 주봉 전환 기준선 {_fmt_price(wi['level'])} ({wi['dist'] * 100:+.1f}%)" if wi.get('level') else ""))
+        elif kind == "BUY" and wst == "W_SWEEP":
+            rs.append(f"주봉 저점 스윕 후 회복(전환 초기 신호) → 리스크 ×{WEEKLY_SWEEP_RISK_MULT:g}")
+        return dict(kind=kind, tranche=tranche, reasons=rs, trigger=trigger)
+
+    if stg in ("SWEEP", "CHOCH", "RETEST") and blocked:
+        return v("NO", None, "일봉 ICT 매수 조건은 나왔지만 주봉이 하락 추세(CHoCH 전)라 설정상 매수를 차단합니다.",
+                 "WEEKLY_DOWN_RISK_MULT 값을 0보다 크게 바꾸면 리스크를 줄여 매수할 수 있습니다.")
+    if stg == "INVALID":
+        return v("NO", None, "스윕 저점 아래로 종가가 내려가 바닥 시나리오가 무효가 됐습니다.",
+                 "이 셋업으로 산 물량은 전량 정리하고, 새 스윕·구조가 나올 때까지 기다립니다.")
+    if stg == "SWEEP":
+        s = ict['sweep']
+        return v("BUY", 1, f"{s['ctx']}에서 직전 저점({_fmt_price(s['level'])})을 쓸고 종가로 회복했습니다 — 무릎 1차 진입 자리입니다.",
+                 "아래 사다리의 1차(30%)를 사고, 체결 즉시 무효화 손절가에 스탑 주문을 걸어 두세요.")
+    if stg == "CHOCH":
+        return v("BUY", 2, f"{ict['choch']['src']}: 직전 반등 고점({_fmt_price(ict['choch']['level'])})을 돌파·안착했습니다 — 2차 진입 자리입니다.",
+                 "1차를 이미 샀다면 2차(30%)를 추가하고, 못 샀다면 2차만 삽니다. 손절가는 그대로 둡니다.")
+    if stg == "RETEST":
+        return v("BUY", 3, f"CHoCH 후 돌파선({_fmt_price(ict['retest']['level'])})까지 되돌림 후 지지 중입니다 — 3차 진입 자리입니다.",
+                 "3차(40%)를 추가합니다. 이후에는 더 사지 않고 💼 포지션 관리 탭으로 관리합니다.")
+    if stg == "PENDING":
+        return v("WAIT", None, "스윕 후 돌파가 나왔지만 종가 안착(2봉) 확인 중입니다.", "안착이 확인되면 2차 매수로 바뀝니다. 미리 사지 마세요.",
+                 trigger=ict['choch']['level'])
+    if stg in ("CHOCH_EXT", "POST"):
+        lv = ict['choch']['level']
+        return v("WAIT", None, "CHoCH 이후 이미 올라가 지금 사면 추격입니다.",
+                 f"돌파선({_fmt_price(lv)}) 근처로 되돌림이 오면 3차(40%)를 삽니다.", trigger=lv)
+    if stg == "IN_ZONE":
+        z = ict['near'][0]
+        return v("WAIT", None, f"{z['kind']}({_fmt_price(z['lo'])}~{_fmt_price(z['hi'])})에 도달했습니다 — 관심 종목입니다.",
+                 "아직 사지 않습니다. 직전 저점을 아래로 쓸고 종가가 다시 올라오면(스윕 후 회복) 1차 매수 신호가 나옵니다.")
+    base = action_verdict(info, plan_trig)
+    if base['kind'] == "BUY":
+        base = dict(kind="WAIT", tranche=None, trigger=base.get('trigger'),
+                    reasons=["돌파는 확정됐지만 ICT 매수 맥락(수요 구간·할인 구간에서의 스윕)이 없습니다.",
+                             "이 전략에서는 사지 않고 관망합니다."])
+    base.setdefault('tranche', None)
+    return base
+
+
+def ict_ladder(info, ict, equity, rate=1.0, qty_dec=0):
+    """
+    3단 분할 매수 사다리 (1회 계획): 1차 30% 스윕 후 회복 · 2차 30% CHoCH 확정 · 3차 40% 돌파선 리테스트
+      손절  : 스윕 저점 − 0.25 ATR (스윕 전이면 직전 저점 또는 수요 구간 하단 기준 예상값) — 모든 차수 공통
+      총액  : 세 차수가 모두 체결된 뒤 손절되면 총자산 × 1% × (200일선 하락 시 0.5) × (보조 필터 2개 미만 0.75)만 잃도록 역산
+      규칙  : 지난 단계는 건너뛰고(남은 차수로 몰아 사지 않음), 손절가 아래에서는 추가 매수 금지
+    가격은 표시 통화(원) 기준으로 반환.
+    """
+    if not ict or not ict.get('ok'):
+        return None
+    if ict.get('stage') == "INVALID":
+        return dict(err="스윕 저점이 깨져 이 셋업은 무효가 됐습니다. 보유 물량은 정리하고, 새 스윕이 나올 때까지 사다리를 만들지 않습니다.",
+                    sl=None, stop_src="-")
+    if ict.get('stage') == "NO_ZONE":
+        return dict(err="지금은 ICT 매수 맥락(주봉 수요 구간 근처)이 아니라 사다리를 만들지 않습니다. "
+                        "가격이 주봉 수요 구간까지 내려오면 1차 예약 가격과 손절가가 계산됩니다.", sl=None, stop_src="-")
+    L, smc = info['levels'], info.get('smc') or {}
+    a = ict['atr']
+    px = ict['px']
+    stg = ict['stage']
+    s, ch, rt = ict.get('sweep'), ict.get('choch'), ict.get('retest')
+
+    # 손절
+    if s:
+        stop, stop_src = s['stop'], "스윕 저점 − 0.25 ATR"
+    elif ict.get('near'):
+        z = ict['near'][0]
+        stop, stop_src = z['lo'] - 0.5 * a, f"{z['kind']} 하단 − 0.5 ATR (예상)"
+    elif L.get('issl') and L['issl'] < px:
+        stop, stop_src = L['issl'] - ICT_STOP_BUF_ATR * a, "직전 저점 − 0.25 ATR (예상)"
+    else:
+        stop, stop_src = px - 2 * a, "현재가 − 2 ATR (예상)"
+
+    # 차수별 가격과 상태
+    if s:
+        e1, st1 = (px, "지금") if stg == "SWEEP" else (s['rec_close'], "지남")
+    else:
+        liq = ict.get('liq')
+        lvl = liq if (liq and liq > stop) else px
+        e1, st1 = lvl, "대기: 최근 저점을 아래로 쓸고 이 가격 위로 종가 회복 시"
+    if s and not ch:
+        brk0 = s.get('choch_level')
+        if brk0 and brk0 > e1:
+            e2, st2 = brk0 + 0.1 * a, "대기: 종가가 이 가격 위로 돌파·안착 시 (CHoCH)"
+            e3, st3 = brk0, "대기: CHoCH 후 돌파선까지 되돌림 시"
+            ch_known = True
+        else:
+            ch_known = False
+    else:
+        ch_known = False
+    if ch:
+        brk = ch['level']
+        if stg == "CHOCH":
+            e2, st2 = px, "지금"
+        elif stg == "PENDING":
+            e2, st2 = max(px, brk), "대기: 종가 안착(2봉) 확인 후"
+        else:
+            e2, st2 = brk, "지남"
+        e3 = brk
+        st3 = "지금" if stg == "RETEST" else "대기: 돌파선까지 되돌림 후 지지 시 (지정가)"
+    elif not ch_known:
+        # 스윕 전: CHoCH 기준선은 스윕이 나와야 정해짐 → 1차 가격 + ATR로 '예상'만 표시
+        e2, st2 = e1 + 1.5 * a, "예상: 스윕 후 반등 고점 돌파 시 (스윕 후 재계산)"
+        e3, st3 = e1 + 1.0 * a, "예상: CHoCH 후 되돌림 시 (스윕 후 재계산)"
+    if e3 > e2:
+        e3 = e2
+
+    wi = ict.get('wict') or {}
+    mult, notes = 1.0, []
+    if wi.get('mult', 1.0) < 1.0:
+        mult *= max(wi['mult'], 0.0)
+        notes.append(f"주봉 {W_STATE_META[wi['state']]['short']} ×{wi['mult']:g}")
+    n_ok = sum(bool(x) for x in ict['filters'].values())
+    if n_ok < 2:
+        mult *= ICT_WEAK_FILTER_MULT
+        notes.append(f"보조 필터 {n_ok}개 ×{ICT_WEAK_FILTER_MULT:g}")
+    risk_eff = RISK_PER_TRADE * mult
+
+    P = [e1 * rate, e2 * rate, e3 * rate]
+    SL = stop * rate
+    if risk_eff <= 0:
+        return dict(err="설정상 주봉 하락 추세에서는 매수하지 않습니다 (WEEKLY_DOWN_RISK_MULT = 0).", sl=SL, stop_src=stop_src)
+    bad = [i + 1 for i, p in enumerate(P) if p <= SL]
+    if bad:
+        return dict(err=f"{', '.join(map(str, bad))}차 가격이 손절가보다 낮거나 같아 사다리를 만들 수 없습니다.", sl=SL, stop_src=stop_src)
+    loss = [(p * (1 + SPLIT_COST) - SL * (1 - SPLIT_COST)) / p for p in P]
+    R = equity * risk_eff / 100
+    amts = [R * wt / lf for wt, lf in zip(ICT_LADDER, loss)]               # 차수별 금액 = (손실 한도 × 배분) ÷ 손절까지 손실률
+    cap = equity * MAX_POSITION_PCT / 100
+    capped = sum(amts) > cap
+    if capped:
+        amts = [x * cap / sum(amts) for x in amts]
+    total = sum(amts)
+    rows, cum_loss = [], 0.0
+    for k, (p, wt, lf, stt, amt0) in enumerate(zip(P, ICT_LADDER, loss, (st1, st2, st3), amts), start=1):
+        q = _qty_floor(amt0 / p, qty_dec)
+        amt = q * p
+        live = stt != "지남"
+        if live:
+            cum_loss += amt * lf
+        rows.append(dict(n=k, weight=wt, price=p, qty=q, amount=amt, status=stt, live=live,
+                         cum_loss=cum_loss, cum_loss_pct=cum_loss / equity * 100))
+    now = next((r for r in rows if r['status'] == "지금"), None)
+    return dict(err=None, rows=rows, sl=SL, sl_pct=(SL / (px * rate) - 1) * 100, stop_src=stop_src, total=total,
+                risk_eff=risk_eff, notes=notes, capped=capped, now=now, filters_ok=n_ok)
+
+
+
+# ==========================================
+# ICT 화면 구성: 결론 배너 · ICT 분석 상자 · 3단 사다리 주문표
+# ==========================================
+def _tdate(t):
+    try:
+        return pd.Timestamp(t).strftime("%Y-%m-%d")
+    except Exception:
+        return "-"
+
+
+def render_ict_banner(v, lad, info, ict, curr, rate, qty_dec, equity):
+    title = VERDICT_STYLE[v['kind']]['title']
+    if v['kind'] == "BUY" and v.get('tranche'):
+        title += f" — {v['tranche']}차"
+    st.markdown(
+        f"""<div style="background:{VERDICT_STYLE[v['kind']]['bg']};color:#fff;padding:16px 20px;border-radius:12px;margin:2px 0 10px 0">
+<div style="font-size:28px;font-weight:800;line-height:1.25">{title}</div>
+<div style="font-size:15px;opacity:.95;margin-top:6px">{'<br>'.join(v['reasons'])}</div></div>""",
+        unsafe_allow_html=True)
+    small = curr * rate < 1000
+    m1, m2, m3, m4 = st.columns(4)
+    ok = lad is not None and not lad.get('err')
+    if v['kind'] == "BUY" and ok and lad.get('now'):
+        r = lad['now']
+        m1.metric(f"① 지금 {r['n']}차 매수", _won(r['price'], small), _qty_txt(r['qty'], qty_dec), delta_color="off")
+        m2.metric("② 공통 손절가 (무효화)", _won(lad['sl'], small), f"{lad['sl_pct']:+.1f}%", delta_color="off")
+        m3.metric("③ 이번 매수 금액", _won(r['amount']), f"총자산의 {r['amount'] / equity * 100:.1f}%", delta_color="off")
+        left = [x for x in lad['rows'] if x['n'] > r['n']]
+        m4.metric("④ 남은 차수", f"{len(left)}개" if left else "없음", " · ".join(f"{x['n']}차 {_won(x['price'], small)}" for x in left) or None,
+                  delta_color="off")
+    elif v['kind'] == "WAIT" and ok:
+        nxt = next((x for x in lad['rows'] if x['status'].startswith("대기")), None)
+        m1.metric("① 다음 매수 조건", f"{nxt['n']}차" if nxt else "-", (nxt['status'].replace("대기: ", "")[:18] if nxt else None), delta_color="off")
+        m2.metric("② 그때 가격", _won(nxt['price'], small) if nxt else "-", (_qty_txt(nxt['qty'], qty_dec) if nxt else None), delta_color="off")
+        m3.metric("③ 예상 손절가", _won(lad['sl'], small), f"{lad['sl_pct']:+.1f}%", delta_color="off")
+        m4.metric("④ 지금 권장 비중", "0%")
+    else:
+        rg = (ict or {}).get('range') or {}
+        L = info.get('levels') or {}
+        m1.metric("① 지금 권장 비중", "0%")
+        wi = (ict or {}).get('wict') or {}
+        wm = W_STATE_META.get(wi.get('state', "W_NA"))
+        m2.metric("② 주봉 추세", f"{wm['icon']} {wm['short']}",
+                  (f"전환 기준선까지 {wi['dist'] * 100:+.1f}%" if (wi.get('dist') is not None and wi.get('state') in ("W_DOWN", "W_SWEEP"))
+                   else (f"레인지 {rg['pos'] * 100:.0f}%" if rg else None)), delta_color="off")
+        m3.metric("③ 직전 저점 (ISSL)", _won(L['issl'] * rate, small) if L.get('issl') else "N/A")
+        z = (ict or {}).get('zones') or []
+        m4.metric("④ 가장 가까운 수요 구간", f"{_won(z[0]['lo'] * rate, small)}~" if z else "없음",
+                  f"현재가 대비 {(z[0]['hi'] / curr - 1) * 100:+.1f}%" if z else None, delta_color="off")
+    st.caption("⚠️ 수요 구간·할인 구간·3박자는 **관심 종목 기준**입니다. 실제 매수는 결론이 **🟢 매수 실행**(스윕 후 회복 → CHoCH → 리테스트 단계)일 때만 하세요.")
+
+
+def render_ict_box(ict, info, rate):
+    if not ict or not ict.get('ok'):
+        st.caption("ICT 분석에 필요한 데이터(일봉 60봉 이상)가 부족합니다.")
+        return
+    small = ict['px'] * rate < 1000
+    W = lambda x: _won(x * rate, small) if x is not None else "-"
+    mk = lambda ok: "✅" if ok else "⬜"
+    with st.container(border=True):
+        st.markdown("##### 🧭 ICT 분석 (주봉 구간 → 일봉 진입)")
+        wk, rg = ict['weekly'], ict['range']
+        wi = ict.get('wict') or {}
+        wm = W_STATE_META.get(wi.get('state', "W_NA"))
+        line = f"- **주봉 추세 판정**: {wm['icon']} **{wm['label']}**"
+        if wi.get('level'):
+            line += (f" · 주봉 CHoCH 기준선({wi.get('level_src', '마지막 반등 고점')}) {W(wi['level'])} (현재가 대비 {wi['dist'] * 100:+.1f}%)"
+                     + (f" · {_tdate(wi['choch_time'])} 돌파" if wi.get('choch_time') is not None and wi['state'] == "W_CHOCH" else ""))
+        if wi.get('sweep'):
+            sw = wi['sweep']
+            line += f" · {_tdate(sw['time'])} 주봉 저점 {W(sw['level'])} 아래 {W(sw['low'])}까지 스윕 후 회복"
+        st.markdown(line)
+        st.caption("주봉 추세가 하락(CHoCH 전)이면 일봉 반등은 단기 반등일 수 있어 사다리 리스크를 "
+                   f"×{WEEKLY_DOWN_RISK_MULT:g}, 주봉 스윕 후 회복이면 ×{WEEKLY_SWEEP_RISK_MULT:g}로 줄입니다. 주봉 CHoCH 이후에는 정상 리스크입니다.")
+        st.markdown(f"- **주봉 스윙 구조**: {wk.get('bias', '판단 불가')}"
+                    + (f" · 고점 {'상승(HH)' if wk.get('hh') else '하락(LH)'} · 저점 {'상승(HL)' if wk.get('hl') else '하락(LL)'}" if wk.get('hh') is not None else ""))
+        if rg:
+            zone_txt = "OTE(62~79% 되돌림)" if rg['ote_lo'] <= ict['px'] <= rg['ote_hi'] else ("할인 구간" if rg['pos'] < 0.5 else "프리미엄 구간")
+            st.markdown(f"- **딜링 레인지 (최근 {ICT_RANGE_W}주)**: {W(rg['lo'])} ~ {W(rg['hi'])} · 중간값 {W(rg['eq'])} · "
+                        f"현재 위치 **{rg['pos'] * 100:.0f}% ({zone_txt})** · OTE {W(rg['ote_lo'])}~{W(rg['ote_hi'])}")
+        if ict['zones']:
+            st.markdown("- **주봉 수요 구간 (현재가 아래)**")
+            for z in ict['zones']:
+                tag = " ← 도달" if z in ict.get('near', []) else ""
+                st.markdown(f"    - {z['kind']} {W(z['lo'])}~{W(z['hi'])} (현재가 대비 {(z['hi'] / ict['px'] - 1) * 100:+.1f}%, {_tdate(z['t'])}){tag}")
+        else:
+            st.markdown("- **주봉 수요 구간**: 현재가 아래에 유효한 구간이 없습니다 (불러온 기간 기준).")
+        s, ch, rt, inv = ict['sweep'], ict['choch'], ict['retest'], ict['invalid']
+        st.markdown("- **일봉 진행 상황**")
+        st.markdown(f"    - {mk(s)} ① 스윕 후 회복: " + (f"{_tdate(s['time'])} 직전 저점 {W(s['level'])} 아래 {W(s['low'])}까지 쓸고 회복 ({s['ctx']})" if s
+                    else ("스윕 실패(무효화) " + _tdate(inv['time']) if inv else "아직 없음")))
+        st.markdown(f"    - {mk(ch and ch['bars_above'] >= CHOCH_SETTLE)} ② CHoCH: " + (f"{_tdate(ch['time'])} 돌파선 {W(ch['level'])} 상향 돌파 · {ch['bars_above']}봉 안착 ({ch['src']})" if ch else "아직 없음"))
+        st.markdown(f"    - {mk(rt)} ③ 리테스트: " + (f"{_tdate(rt['time'])} 돌파선 {W(rt['level'])}까지 되돌림 후 지지" if rt else "아직 없음"))
+        f = ict['filters']
+        n_ok = sum(bool(x) for x in f.values())
+        st.markdown(f"- **보조 필터 ({n_ok}/{len(f)})**: " + " · ".join(f"{'✓' if ok else '✗'} {k}" for k, ok in f.items()))
+        st.caption("보조 필터는 점수로 더하지 않습니다. 2개 미만이면 사다리 리스크를 0.75배로 줄입니다. "
+                   "수요 구간은 강한 주봉 상승 직전의 마지막 음봉(오더블록)과 주봉 가격 공백(FVG)으로 계산합니다.")
+
+
+def render_ladder(v, lad, curr, rate, qty_dec, equity):
+    with st.expander("🪜 3단 분할 매수 사다리 (손실 한도 30% 스윕 후 회복 · 30% CHoCH · 40% 리테스트 · 공통 손절)", expanded=v['kind'] == "BUY"):
+        if lad is None:
+            st.caption("사다리를 만들 데이터가 부족합니다.")
+            return
+        if lad.get('err'):
+            (st.info if "맥락" in lad['err'] else st.error)(lad['err'])
+            return
+        small = curr * rate < 1000
+        names = {1: "1차 · 스윕 후 회복", 2: "2차 · CHoCH 확정", 3: "3차 · 돌파선 리테스트"}
+        rows = [{"차수": f"{names[r['n']]} (손실 한도 {int(r['weight'] * 100)}%)", "상태": r['status'], "가격": _won(r['price'], small),
+                 "수량": _qty_txt(r['qty'], qty_dec), "금액": _won(r['amount']),
+                 "여기까지 산 뒤 손절 시 손실": (f"{_won(r['cum_loss'])} ({r['cum_loss_pct']:.2f}%)" if r['live'] else "-")} for r in lad['rows']]
+        rows.append({"차수": "🛑 공통 손절 (무효화)", "상태": "1차 체결 즉시 스탑 주문 · 모든 차수 공통", "가격": _won(lad['sl'], small),
+                     "수량": "전량", "금액": "-", "여기까지 산 뒤 손절 시 손실": "-"})
+        st.dataframe(pd.DataFrame(rows), hide_index=True)
+        st.markdown(f"- 계획 총액(3차 모두 체결 시): **{_won(lad['total'])}** (총자산의 {lad['total'] / equity * 100:.1f}%) · "
+                    f"적용 리스크 {lad['risk_eff']:.2f}%" + (f" ({', '.join(lad['notes'])})" if lad['notes'] else "")
+                    + f" · 손절 기준: {lad['stop_src']}")
+        st.markdown("- **배분 방식**: 손실 한도(총자산 × 리스크)를 30/30/40으로 나눠, 각 차수가 손절 시 자기 몫만 잃도록 수량을 정합니다. "
+                    "손절가에 가까운 1차(무릎)일수록 같은 손실로 더 많이 살 수 있어 금액이 커집니다.")
+        st.markdown("- **규칙**: ① '지남' 차수는 건너뜁니다 (남은 차수로 몰아 사지 않음) ② 손절가 아래에서는 절대 추가 매수 금지 "
+                    "③ 손절가에 닿으면 몇 차까지 샀든 전량 정리 ④ 같은 종목에서 연속 2번 무효화되면 새 고점·저점 구조가 나올 때까지 쉬기")
+        if lad['capped']:
+            st.warning(f"계산된 금액이 한 종목 최대 비중({MAX_POSITION_PCT:g}%)을 넘어 {MAX_POSITION_PCT:g}%로 제한했습니다.")
+        if any(r['qty'] == 0 for r in lad['rows'] if r['live']):
+            st.warning("수량이 0인 차수가 있습니다 (1주 가격이 배정 금액보다 큼). 이 종목은 차수를 줄이거나 매수하지 않는 편이 맞습니다.")
+        if v['kind'] != "BUY":
+            st.info("지금은 🟢 매수 실행 상태가 아니므로 이 표는 **조건이 충족됐을 때의 예약 계획**입니다. 지금 주문하지 마세요.")
+        st.caption(f"※ 손실에는 편도 {SPLIT_COST * 100:.2f}%의 수수료·슬리피지를 포함했습니다. 총자산은 사이드바에서 바꿀 수 있습니다.")
+
+
+
 def render_dashboard(df, c1, c2, show_hist, rate_text=1.0, rate_chart=1.0, is_commodity=False,
-                     captions=(), tf_label=None, htf=None, macro=None):
+                     captions=(), tf_label=None, htf=None, macro=None, qty_dec=0):
     curr = float(df['close'].iloc[-1])
     fibs = calculate_fibonacci_levels(df, is_commodity=is_commodity)
-    pack = prepare_htf(htf, tf_label)
-    t_last = _naive(df['time']).iloc[-1].to_datetime64().astype('datetime64[ns]')
-    info = analyze_market_cycle(df, mtf_at(pack, t_last), macro)
+    # 거시 추세 필터: 일봉은 데이터 안의 200일선(스크리너와 동일), 그 외 프레임은 기존 상위 프레임 방식
+    if tf_label == "1일":
+        pack, mtf = None, daily_regime(df)
+    else:
+        pack = prepare_htf(htf, tf_label)
+        t_last = _naive(df['time']).iloc[-1].to_datetime64().astype('datetime64[ns]')
+        mtf = mtf_at(pack, t_last)
+    info = analyze_market_cycle(df, mtf, macro)
     meta = PHASE_META[info['phase']]
+    plan_now = build_trade_plan(info) if info['entry'] in ("TRIGGER", "BREAKOUT") or info['phase'] == "상승" else None
+    use_ict = tf_label == "1일"
+    if use_ict:                                   # ICT 메인: 주봉 구간 + 일봉 스윕·CHoCH·리테스트 사다리
+        ict = ict_analysis(df, info)
+        v = ict_verdict(info, ict, plan_now if info['entry'] == "TRIGGER" else None)
+        lad = ict_ladder(info, ict, EQUITY, rate_text, qty_dec)
+        # 사다리 가격은 표시 통화(rate_text) 기준 → 원래 통화로 되돌려 차트(rate_chart)에 그림
+        extra = [(lad['sl'] / rate_text, "무효화 손절", "#ef5350")] if (lad and not lad.get('err') and rate_text) else []
+        if lad and not lad.get('err'):
+            extra += [(r['price'] / rate_text, f"{r['n']}차", "#42a5f5") for r in lad['rows'] if r['live']]
+        zones = ict.get('zones') if ict else None
+        fig_plan = None
+    else:                                          # 분봉·주봉·월봉: 기존 결론 + 2분할 플랜
+        ict, lad, extra, zones = None, None, [], None
+        v = action_verdict(info, plan_now if info['entry'] == "TRIGGER" else None)
+        plan2 = entry_plan_2split(info, curr, EQUITY, rate_text, qty_dec)
+        fig_plan = plan_now if v['kind'] == "BUY" else None      # 차트의 손절·익절선은 🟢일 때만
 
     with c1:
-        st.subheader(f"현재 국면: {meta['icon']} {info['phase']} ({info['score']}/100점 일치)")
-        tot = info['totals']
-        st.caption("국면 일치도 — " + " | ".join(f"{k} {tot[k]}" for k in ["매집", "상승", "분배", "하락"]))
-        if info['adjust']:
-            st.caption("보정: " + " · ".join(info['adjust']))
+        if use_ict:
+            render_ict_banner(v, lad, info, ict, curr, rate_text, qty_dec, EQUITY)
+            render_ladder(v, lad, curr, rate_text, qty_dec, EQUITY)
+            render_ict_box(ict, info, rate_text)
+        else:
+            render_action_banner(v, plan2, info, curr, rate_text, qty_dec, EQUITY)
+            render_entry_plan(v, plan2, info, curr, rate_text, qty_dec, EQUITY)
+            st.caption("ℹ️ ICT 사다리(스윕 → CHoCH → 리테스트)는 '1일' 프레임에서 계산됩니다.")
         for cap in captions:
             st.caption(cap)
+        st.divider()
+        st.markdown(f"###### 📎 참고 지표 — 국면 {meta['icon']} {info['phase']} ({info['score']}/100점)")
+        tot = info['totals']
+        st.caption("국면 일치도 — " + " | ".join(f"{k} {tot[k]}" for k in ["매집", "상승", "분배", "하락"])
+                   + " · 점수는 '현재 위치 설명'이며 매수 신호가 아닙니다.")
+        if info['adjust']:
+            st.caption("보정: " + " · ".join(info['adjust']))
         if info['bars'] < 80:
             st.caption("⚠️ 데이터가 짧아 국면 판별 신뢰도가 낮습니다.")
         render_fact_box(info['facts'])
         render_phase_legend()
-        st.divider()
         render_trade_guide(info, fibs, curr, rate_text)
 
     with c2:
@@ -1221,16 +2169,10 @@ def render_dashboard(df, c1, c2, show_hist, rate_text=1.0, rate_chart=1.0, is_co
         if show_hist:
             try:
                 with st.spinner(f"과거 국면 연산 중... (최근 {HIST_BARS}봉)"):
-                    history = cached_phase_history(df, pack)
+                    history = cached_phase_history(df, pack, daily=(tf_label == "1일"))
             except Exception as e:
                 st.error(f"과거 국면 계산 실패 ({type(e).__name__}): {e}")
-        plan = None
-        if info['entry'] in ("TRIGGER", "BREAKOUT") or info['phase'] == "상승":
-            try:
-                plan = build_trade_plan(info)
-            except Exception:
-                plan = None
-        st.plotly_chart(build_chart(df, fibs, rate_chart, history, info, plan), width="stretch")
+        st.plotly_chart(build_chart(df, fibs, rate_chart, history, info, fig_plan, extra_lines=extra, zones=zones), width="stretch")
 
 def render_dashboard_safe(df, c1, c2, show_hist, rate_chart=1.0, is_commodity=False, **kw):
     """고급 분석에서 어떤 예외가 나도 대시보드가 죽지 않도록, 기본 기술적 지표만으로 안전하게 폴백"""
@@ -1238,7 +2180,8 @@ def render_dashboard_safe(df, c1, c2, show_hist, rate_chart=1.0, is_commodity=Fa
         render_dashboard(df, c1, c2, show_hist, rate_chart=rate_chart, is_commodity=is_commodity, **kw)
     except Exception as e:
         with c1:
-            st.warning(f"⚠️ 고급 분석 엔진 오류({type(e).__name__})로 기본 기술적 지표만 표시합니다.")
+            st.error(f"🔴 절대 매수 금지 — 분석 엔진 오류({type(e).__name__})로 판정하지 못했습니다. 판정할 수 없을 때는 사지 않습니다.")
+            st.caption("아래는 참고용 기본 지표입니다.")
             try:
                 px = float(df['close'].iloc[-1])
                 e20, e50, rsi = _val(df, 'EMA_20'), _val(df, 'EMA_50'), _val(df, 'RSI')
@@ -1293,6 +2236,13 @@ def load_yf_data(ticker, tf_label):
     period = "60d" if yf_tf in ["15m", "60m"] else ("2y" if yf_tf == "1d" else "10y")
     try:
         df = yf.download(ticker, period=period, interval=yf_tf, progress=False, timeout=10)
+        return _prep_yf_frame(df, tf_label)
+    except Exception as e:
+        return pd.DataFrame(), f"{type(e).__name__}: {e}"
+
+def _prep_yf_frame(df, tf_label):
+    """yfinance 응답(단일 종목) → 앱 공통 형식 + 지표. (df, 에러메시지) 반환. 단일 조회와 스크리너 묶음 조회가 함께 사용"""
+    try:
         if df is None or df.empty:
             return pd.DataFrame(), "yfinance에서 빈 데이터가 반환되었습니다."
         if isinstance(df.columns, pd.MultiIndex):
@@ -1336,12 +2286,564 @@ def load_htf_safe(loader, up_tf):
 
 
 # ==========================================
+# 💼 포지션 관리(매도 판단): 매수 판정 지표를 매도 관점으로 역활용 (가격은 종목 통화 기준)
+# ==========================================
+SELL_TRAIL_N = 22          # 트레일링 기준 고점을 찾는 최근 봉 수 (약 1개월)
+
+def sell_analysis(df, avg_px, qty, qty_dec=0):
+    """
+    보유 종목 청산 분석.
+      ① 1차 구조적 익절가 (50%): 현재가보다 1 ATR 이상 위의 가장 가까운 매물대 저항
+      ② 잔여 50% 트레일링 스탑: 최근 22봉 최고가 − 3 ATR (매일 갱신, 올리기만)
+      ③ 위험 알림
+         🔴 즉시 전량 매도 : 종가가 트레일링 스탑 아래 마감 / 직전 저점(ISSL) 종가 이탈(구조 붕괴)
+         🟠 절반 익절      : 고점 징후 2개 이상 (분배 국면, 약세 다이버전스, 고점권 대량 윗꼬리, OBV 약세, VAH 돌파 실패, 바로 위 저항)
+         🟡 보유 · 주의    : 고점 징후 1개
+         🟢 보유 유지      : 해당 없음
+    고점 징후(분배 등)는 예측력이 검증되지 않아 '즉시 매도'가 아니라 '절반 익절' 단계로만 씁니다.
+    """
+    mtf = daily_regime(df)
+    info = analyze_market_cycle(df, mtf, None, False)
+    F = _features(df.tail(200))
+    L = info['levels']
+    atr = L.get('atr_abs') or 0.0
+    px = float(df['close'].iloc[-1])
+    dc = df.iloc[:-1] if len(df) > 1 else df            # 마감 확정 봉
+    last_close = float(dc['close'].iloc[-1])
+    hh = float(dc['high'].tail(SELL_TRAIL_N).max())
+    trail = hh - TP3_TRAIL_ATR * atr if atr else None
+    tp, tp_lab = structural_target(L, px, atr) if atr else (None, "-")
+
+    hard, soft = [], []
+    if trail is not None and last_close < trail:
+        hard.append(f"종가가 트레일링 스탑({_fmt_price(trail)}) 아래로 마감했습니다.")
+    if info['entry'] in ("WHIPSAW", "DOWN"):
+        hard.append("직전 저점(ISSL)을 종가로 이탈해 상승 구조가 무너졌습니다 (Bearish CHoCH).")
+    if info['phase'] == "분배":
+        soft.append(f"분배 국면 판정 ({info['score']}점): 고점권 거래량·윗꼬리·고점 하락 징후")
+    if F.bear_rsi or F.bear_macd:
+        soft.append("약세 다이버전스: 가격은 고점을 높였는데 " + " · ".join(
+            k for k, ok in (("RSI", F.bear_rsi), ("MACD", F.bear_macd)) if ok) + "는 낮아짐")
+    if F.dist_climax:
+        soft.append("고점권 대량 거래 + 긴 윗꼬리: 물량을 넘기는 흔적")
+    elif F.wick_cluster:
+        soft.append(f"고점권에서 최근 10봉 중 윗꼬리 캔들 {F.wick_cnt}개")
+    if F.bear_obv:
+        soft.append("가격은 버티는데 OBV(거래량 흐름)가 줄어듦")
+    if F.va_fail:
+        soft.append("매물대 상단(VAH) 돌파 실패 후 되밀림")
+    near = [(v, lab) for lab, v in (L.get('resistances') or []) if v is not None and px < v <= px + 0.5 * atr]
+    if near:
+        v0, lab0 = min(near)
+        soft.append(f"바로 위 저항({lab0} {_fmt_price(v0)})에 근접")
+
+    if hard:
+        level = "SELL_ALL"
+    elif len(soft) >= 2:
+        level = "SELL_HALF"
+    elif len(soft) == 1:
+        level = "CAUTION"
+    else:
+        level = "HOLD"
+
+    q1 = _qty_floor(qty * 0.5, qty_dec)
+    q2 = qty - q1
+    return dict(info=info, px=px, last_close=last_close, atr=atr, trail=trail, trail_base=hh, tp=tp, tp_label=tp_lab,
+                hard=hard, soft=soft, level=level, q1=q1, q2=q2, mtf=mtf,
+                pnl=(px - avg_px) * qty, pnl_pct=(px / avg_px - 1) * 100 if avg_px else None,
+                pnl_tp=(tp - avg_px) * q1 if tp is not None else None,
+                pnl_trail=(trail - avg_px) * q2 if trail is not None else None,
+                pnl_trail_all=(trail - avg_px) * qty if trail is not None else None)
+
+
+SELL_STYLE = {
+    "SELL_ALL":  dict(title="🔴 즉시 전량 매도", bg="#c62828"),
+    "SELL_HALF": dict(title="🟠 절반 익절 (비중 축소)", bg="#e65100"),
+    "CAUTION":   dict(title="🟡 보유 · 주의", bg="#b28704"),
+    "HOLD":      dict(title="🟢 보유 유지", bg="#2e7d32"),
+}
+
+
+POS_STYLE = {
+    "STOP":    dict(title="🔴 손절: 전량 매도", bg="#c62828"),
+    "EXIT":    dict(title="🔴 전량 매도 (이익 보호)", bg="#c62828"),
+    "HALF":    dict(title="🟠 절반 익절 (비중 축소)", bg="#e65100"),
+    "TP1":     dict(title="🟠 1차 익절 (50%)", bg="#e65100"),
+    "ADD":     dict(title="🔵 추가 매수", bg="#1565c0"),
+    "CAUTION": dict(title="🟡 보유 · 주의", bg="#b28704"),
+    "HOLD":    dict(title="🟢 보유 유지", bg="#2e7d32"),
+}
+POS_TP1_R = 2.0        # 1차 익절 최소 거리 (평단 − 손절가의 2배)
+POS_MODES = ["사다리 1차까지 매수", "사다리 2차까지 매수", "사다리 3차까지 매수", "사다리와 무관하게 보유"]
+
+
+def position_suggest_stop(df, avg_px, qty, bought, qty_dec=0, equity=10_000_000.0, rate=1.0):
+    """포지션 관리 탭의 '내 손절가' 기본값 (종목 통화). 사다리면 무효화 손절, 아니면 트레일링"""
+    r = sell_analysis(df, avg_px, qty, qty_dec)
+    if bought:
+        ict = ict_analysis(df, r['info'])
+        lad = ict_ladder(r['info'], ict, equity, rate, qty_dec)
+        if lad and not lad.get('err') and lad.get('sl'):
+            return lad['sl'] / rate, "사다리 무효화 손절 (스윕 저점 − 0.25 ATR)"
+        if r['info']['levels'].get('issl') and r['info']['levels']['issl'] < r['px']:
+            return r['info']['levels']['issl'] - ICT_STOP_BUF_ATR * r['atr'], "직전 저점 − 0.25 ATR"
+    if r['trail']:
+        return r['trail'], f"트레일링 (최근 {SELL_TRAIL_N}봉 고점 − {TP3_TRAIL_ATR:g} ATR)"
+    return r['px'] - 2 * r['atr'], "현재가 − 2 ATR"
+
+
+def position_plan(df, avg_px, qty, bought, tp1_done, my_stop, qty_dec=0, equity=10_000_000.0, rate=1.0):
+    """
+    보유 종목 하나의 '지금 할 일'과 손절가 (가격은 종목 통화, 손실 금액은 원화 환산도 함께)
+      bought   : 0 = 사다리와 무관, 1·2·3 = 사다리 몇 차까지 샀는지
+      tp1_done : 1차 익절(50%)을 이미 했는지
+      my_stop  : 매수할 때 정한 손절가 (내리지 않음)
+    손절가 단계: 1차 익절 전 = 내 손절가 → 1차 익절 후 = max(내 손절가, 평단가(본절), 트레일링)
+    판단 순서: 손절 → 전량 매도 → 절반 익절 → 1차 익절 → 추가 매수 → 주의 → 보유
+    """
+    r = sell_analysis(df, avg_px, qty, qty_dec)
+    info = r['info']
+    ict = ict_analysis(df, info)
+    lad = ict_ladder(info, ict, equity, rate, qty_dec)
+    px, lc, atr = r['px'], r['last_close'], r['atr']
+    L = info['levels']
+    # 1차 익절 목표: 평단 + 2R(R = 평단 − 내 손절가) 이상에 있는 첫 저항, 없으면 평단 + 2R
+    risk = avg_px - my_stop if my_stop < avg_px else (atr or avg_px * 0.05)
+    floor_tp = avg_px + POS_TP1_R * risk
+    cands = sorted((v, lab) for lab, v in (L.get('resistances') or []) if v is not None and np.isfinite(v) and v >= floor_tp)
+    tp_hold, tp_lab = cands[0] if cands else (floor_tp, f"손익비 {POS_TP1_R:g}R")
+    trail = r['trail']
+    if bought == 0:                      # 사다리와 무관: 기존 매도 규칙(트레일링 · 구조 붕괴)
+        cands2 = [(my_stop, "내 손절가")] + ([(trail, "트레일링")] if trail else [])
+        stop, stop_kind = max(cands2, key=lambda x: x[0])
+        tp_hold = None
+    elif tp1_done:
+        cands = [(my_stop, "내 손절가"), (avg_px, "본절(평단가)")] + ([(trail, "트레일링")] if trail else [])
+        stop, stop_kind = max(cands, key=lambda x: x[0])
+    else:
+        stop, stop_kind = my_stop, "내 손절가 (매수 때 정한 값)"
+    reasons, action, add_row = [], "HOLD", None
+    if lc < stop:
+        action = "STOP" if stop < avg_px else "EXIT"
+        reasons.append(f"종가 {_fmt_price(lc)}가 손절가 {_fmt_price(stop)}({stop_kind}) 아래로 마감했습니다. 다음 봉에 전량 매도합니다.")
+    elif r['hard'] and (tp1_done or bought == 0):
+        action = "EXIT"
+        reasons += r['hard']
+    elif not tp1_done and len(r['soft']) >= 2:
+        action = "HALF"
+        reasons += r['soft']
+    elif not tp1_done and tp_hold and px >= tp_hold:
+        action = "TP1"
+        reasons.append(f"1차 익절가 {_fmt_price(tp_hold)}({tp_lab})에 도달했습니다. 절반을 팔고 남은 물량의 손절가를 평단가 이상으로 올리세요.")
+    else:
+        if bought in (1, 2) and lad and not lad.get('err'):
+            add_row = next((x for x in lad['rows'] if x['n'] == bought + 1 and x['status'] == "지금"), None)
+        if add_row and px > stop:
+            action = "ADD"
+            reasons.append(f"사다리 {add_row['n']}차 조건이 지금 충족됐습니다. 손절가는 그대로 두고 {add_row['n']}차를 추가합니다.")
+        elif r['soft']:
+            action = "CAUTION"
+            reasons += r['soft']
+            reasons.append("징후가 하나뿐이라 아직 팔지 않고, 손절가를 지키며 지켜봅니다.")
+        else:
+            reasons.append("손절가 위에서 정상 보유 중입니다. 손절 주문을 걸어 둔 채 기다립니다.")
+    if r['hard'] and action not in ("STOP", "EXIT"):
+        reasons.append("⚠️ " + " ".join(r['hard']) + " — 다만 사다리 1차 익절 전에는 '내 손절가'를 기준으로 판단합니다.")
+    loss = (stop - avg_px) * qty
+    return dict(r=r, ict=ict, lad=lad, action=action, reasons=reasons, stop=stop, stop_kind=stop_kind,
+                dist=(stop / px - 1), loss=loss, loss_krw=loss * rate, loss_pct=loss * rate / equity * 100,
+                tp=tp_hold, tp_label=tp_lab, trail=trail, add_row=add_row, px=px, last_close=lc,
+                pnl=(px - avg_px) * qty, pnl_pct=(px / avg_px - 1) * 100)
+
+
+# ==========================================
+# 🔎 스크리너: 종목 목록 (섹터별 대표 종목 · 직접 고쳐 쓰세요)
+# ==========================================
+SCREEN_UNIVERSE = {
+    "🇰🇷 국내 (KOSPI)": {
+        "반도체": [("005930.KS", "삼성전자"), ("000660.KS", "SK하이닉스"), ("042700.KS", "한미반도체"), ("009150.KS", "삼성전기"), ("000990.KS", "DB하이텍")],
+        "2차전지": [("373220.KS", "LG에너지솔루션"), ("006400.KS", "삼성SDI"), ("005490.KS", "POSCO홀딩스"), ("051910.KS", "LG화학"), ("003670.KS", "포스코퓨처엠")],
+        "방산·항공우주": [("012450.KS", "한화에어로스페이스"), ("047810.KS", "한국항공우주"), ("064350.KS", "현대로템"), ("079550.KS", "LIG넥스원"), ("272210.KS", "한화시스템")],
+        "조선": [("009540.KS", "HD한국조선해양"), ("329180.KS", "HD현대중공업"), ("042660.KS", "한화오션"), ("010140.KS", "삼성중공업"), ("443060.KS", "HD현대마린솔루션")],
+        "전력기기": [("267260.KS", "HD현대일렉트릭"), ("010120.KS", "LS ELECTRIC"), ("298040.KS", "효성중공업"), ("034020.KS", "두산에너빌리티"), ("006260.KS", "LS")],
+        "원전·유틸리티": [("015760.KS", "한국전력"), ("052690.KS", "한전기술"), ("051600.KS", "한전KPS"), ("000720.KS", "현대건설"), ("036460.KS", "한국가스공사")],
+        "자동차": [("005380.KS", "현대차"), ("000270.KS", "기아"), ("012330.KS", "현대모비스"), ("204320.KS", "HL만도"), ("086280.KS", "현대글로비스")],
+        "바이오": [("207940.KS", "삼성바이오로직스"), ("068270.KS", "셀트리온"), ("000100.KS", "유한양행"), ("326030.KS", "SK바이오팜"), ("128940.KS", "한미약품")],
+        "인터넷·게임": [("035420.KS", "NAVER"), ("035720.KS", "카카오"), ("259960.KS", "크래프톤"), ("036570.KS", "엔씨소프트"), ("251270.KS", "넷마블")],
+        "금융": [("105560.KS", "KB금융"), ("055550.KS", "신한지주"), ("086790.KS", "하나금융지주"), ("316140.KS", "우리금융지주"), ("138040.KS", "메리츠금융지주")],
+    },
+    "🇺🇸 미국": {
+        "빅테크": [("AAPL", "애플"), ("MSFT", "마이크로소프트"), ("GOOGL", "알파벳"), ("AMZN", "아마존"), ("META", "메타")],
+        "반도체·AI": [("NVDA", "엔비디아"), ("AVGO", "브로드컴"), ("TSM", "TSMC"), ("AMD", "AMD"), ("MU", "마이크론")],
+        "소프트웨어·AI": [("PLTR", "팔란티어"), ("ORCL", "오라클"), ("CRM", "세일즈포스"), ("NOW", "서비스나우"), ("ADBE", "어도비")],
+        "사이버보안": [("CRWD", "크라우드스트라이크"), ("PANW", "팔로알토"), ("FTNT", "포티넷"), ("ZS", "지스케일러"), ("NET", "클라우드플레어")],
+        "방산": [("LMT", "록히드마틴"), ("RTX", "RTX"), ("NOC", "노스롭그루먼"), ("GD", "제너럴다이내믹스"), ("LHX", "L3해리스")],
+        "항공우주·우주": [("GE", "GE에어로스페이스"), ("BA", "보잉"), ("HWM", "하우멧"), ("RKLB", "로켓랩"), ("ASTS", "AST스페이스모바일")],
+        "전력·원전": [("GEV", "GE버노바"), ("CEG", "컨스텔레이션"), ("VST", "비스트라"), ("NEE", "넥스트에라"), ("OKLO", "오클로")],
+        "금융": [("JPM", "JP모건"), ("V", "비자"), ("MA", "마스터카드"), ("BAC", "뱅크오브아메리카"), ("GS", "골드만삭스")],
+        "헬스케어": [("LLY", "일라이릴리"), ("UNH", "유나이티드헬스"), ("JNJ", "존슨앤존슨"), ("ABBV", "애브비"), ("MRK", "머크")],
+        "에너지": [("XOM", "엑슨모빌"), ("CVX", "쉐브론"), ("COP", "코노코필립스"), ("SLB", "SLB"), ("EOG", "EOG")],
+        "소비·모빌리티": [("TSLA", "테슬라"), ("COST", "코스트코"), ("WMT", "월마트"), ("HD", "홈디포"), ("UBER", "우버")],
+        "ETF·지수": [("SPY", "S&P500"), ("QQQ", "나스닥100"), ("DIA", "다우"), ("IWM", "러셀2000"), ("VTI", "미국 전체")],
+        "ETF·레버리지(3x)": [("SOXL", "반도체 3x"), ("TQQQ", "나스닥 3x"), ("UPRO", "S&P500 3x"), ("TECL", "기술주 3x"), ("TNA", "러셀2000 3x")],
+        "ETF·섹터테마": [("SOXX", "반도체"), ("SMH", "반도체(반에크)"), ("ITA", "항공우주·방산"), ("XLE", "에너지"), ("ARKK", "혁신기술"),
+                       ("XLK", "기술주"), ("XLF", "금융"), ("XLV", "헬스케어")],
+        "ETF·배당채권금": [("SCHD", "배당성장"), ("JEPI", "커버드콜 S&P"), ("JEPQ", "커버드콜 나스닥"), ("VYM", "고배당"), ("VTV", "가치주"),
+                        ("TLT", "미국채 20년+"), ("IEF", "미국채 7-10년"), ("GLD", "금")],
+    },
+    "🪙 코인": {
+        "대장·메이저 알트": [("BTC/USDT", "비트코인"), ("ETH/USDT", "이더리움"), ("BNB/USDT", "BNB"), ("SOL/USDT", "솔라나"), ("XRP/USDT", "리플"),
+                         ("DOGE/USDT", "도지코인"), ("ADA/USDT", "에이다"), ("TRX/USDT", "트론"), ("LINK/USDT", "체인링크"), ("AVAX/USDT", "아발란체")],
+    },
+}
+def tab_groups(market, etf=None):
+    """트레이딩 룸 탭용 종목 목록: SCREEN_UNIVERSE를 그대로 읽어 {섹터: ["티커 (이름)", ...]} 형태로 변환.
+    etf=True면 ETF 그룹만, False면 ETF 그룹 제외, None이면 전부. (종목은 SCREEN_UNIVERSE 한곳에서만 고치면 됨)"""
+    out = {}
+    for sec, items in SCREEN_UNIVERSE.get(market, {}).items():
+        is_etf = sec.startswith("ETF")
+        if etf is True and not is_etf or etf is False and is_etf:
+            continue
+        out[sec.replace("ETF·", "") if etf else sec] = [f"{t} ({n})" for t, n in items]
+    return out
+
+
+CANDIDATE_STAGES = ["🟢 1차: 스윕 후 회복", "🟢 2차: CHoCH 확정", "🟢 3차: 리테스트", "⏳ CHoCH 안착 대기",
+                    "⏳ 3차 리테스트 대기", "🎯 수요 구간 도달", "🧲 셋업", "🔵 매집 관찰"]          # 무릎 매수 후보 (우선순위 순)
+STAGE_ORDER = CANDIDATE_STAGES + ["🎯 트리거(셋업O)", "⏳ 안착 대기", "📈 돌파(셋업X)", "🚫 추격 구간", "🟢 상승", "🟣 분배",
+                                  "⛔ 200일선 하락 중", "🪤 무효화(스윕 실패)", "🪤 휩쏘", "🔴 하락", "⚠️ 데이터 오류"]
+BROKE_STAGES = ("🟢 2차: CHoCH 확정", "🟢 3차: 리테스트", "⏳ CHoCH 안착 대기", "⏳ 3차 리테스트 대기",
+                "🎯 트리거(셋업O)", "📈 돌파(셋업X)", "⏳ 안착 대기", "🚫 추격 구간")          # 이미 돌파선을 넘은 단계
+
+
+def classify_stage(info):
+    """기존 엔진의 진입 상태·국면 → 스크리너 단계. 셋업 있는 돌파(TRIGGER)와 셋업 없는 돌파(BREAKOUT)를 분리"""
+    entry, phase = info.get("entry"), info.get("phase")
+    if entry in ("TRIGGER", "BREAKOUT"):
+        if info.get("extended"):
+            return "🚫 추격 구간"
+        return "🎯 트리거(셋업O)" if entry == "TRIGGER" else "📈 돌파(셋업X)"
+    if entry == "SETUP":
+        return "🧲 셋업"
+    if entry == "PENDING":
+        return "⏳ 안착 대기"
+    if entry == "WHIPSAW":
+        return "🪤 휩쏘"
+    if entry == "BLOCKED":
+        return "⛔ 200일선 하락 중"
+    if entry == "DOWN":
+        return "🔴 하락"
+    return {"매집": "🔵 매집 관찰", "상승": "🟢 상승", "분배": "🟣 분배"}.get(phase, "🔴 하락")
+
+
+def _ret_since(df, days):
+    t = pd.to_datetime(df["time"])
+    past = df[t <= t.iloc[-1] - pd.Timedelta(days=days)]
+    if past.empty:
+        return None
+    return float(df["close"].iloc[-1] / past["close"].iloc[-1] - 1)
+
+
+def _flow_metrics(df):
+    """종목 하나의 자금 유입 지표: 거래대금 증가율(최근 20일 ÷ 그 전 120일 평균 − 1), CMF20, 50·200일선 위치"""
+    c, v = df["close"].astype(float), df["volume"].astype(float) if "volume" in df.columns else None
+    out = dict(거래대금증가=None, CMF=None, 오십일선거리=None, 이백일선위=None)
+    if v is not None and len(df) >= 60 and v.tail(20).sum() > 0:
+        dv = c * v
+        prev = dv.iloc[-140:-20] if len(dv) >= 140 else dv.iloc[:-20]
+        if len(prev) >= 20 and prev.mean() > 0:
+            out["거래대금증가"] = float(dv.tail(20).mean() / prev.mean() - 1)
+        h, l = df["high"].astype(float), df["low"].astype(float)
+        mfm = ((c - l) - (h - c)) / (h - l).replace(0, np.nan)
+        vv = v.tail(20)
+        if vv.sum() > 0:
+            out["CMF"] = float((mfm.tail(20).fillna(0) * vv).sum() / vv.sum())
+    if len(c) >= 50:
+        out["오십일선거리"] = float(c.iloc[-1] / c.rolling(50).mean().iloc[-1] - 1)
+    if len(c) >= 200:
+        out["이백일선위"] = bool(c.iloc[-1] > c.rolling(200).mean().iloc[-1])
+    return out
+
+
+def screen_row(df, market, sector, ticker, name):
+    """종목 하나를 상세 화면(1일)과 같은 규칙으로 판정: 기존 엔진 + 일봉 200일선 필터 + ICT 사다리 단계"""
+    row = dict(시장=market, 섹터=sector, 티커=ticker, 종목=name)
+    try:
+        mtf = daily_regime(df)
+        info = analyze_market_cycle(df, mtf, None, False)
+        ict = ict_analysis(df, info)
+    except Exception as e:
+        row.update(단계="⚠️ 데이터 오류", 결론="-", 비고=f"{type(e).__name__}")
+        return row
+    L = info["levels"]
+    price = L.get("price")
+    stage = ICT_STAGE_LABEL.get(ict.get("stage")) or classify_stage(info)
+    plan_trig = build_trade_plan(info) if info["entry"] == "TRIGGER" else None
+    verdict = ict_verdict(info, ict, plan_trig)
+    lad = ict_ladder(info, ict, 1_000_000.0, 1.0, None)                # 손절선·다음 가격 계산용 (금액은 쓰지 않음)
+    stop = lad["sl"] if (lad and not lad.get("err")) else None
+    nxt = next((r for r in (lad or {}).get("rows", []) if r["status"] == "지금" or r["status"].startswith("대기")), None) \
+        if (lad and not lad.get("err")) else None
+    broke = stage in BROKE_STAGES
+    ref = build_trade_plan(info, entry=price, assume_trigger=True) if price else None
+    target = L["ibsl"] if (L.get("ibsl") and price and L["ibsl"] > price and not broke) else (ref["tp_struct"] if ref else None)
+    tri = info.get("triple") or {}
+    close = df["close"]
+    tv = (close * df["volume"]).tail(20).mean() if "volume" in df.columns else None
+    zn = (ict.get("zones") or [None])[0]
+    rg = ict.get("range") or {}
+    row.update(
+        결론=VERDICT_STYLE[verdict["kind"]]["title"] + (f" {verdict['tranche']}차" if verdict.get("tranche") else ""),
+        단계=stage, 국면=info["phase"], 국면점수=info["score"], 매집점수=info["totals"].get("매집", 0),
+        진바닥3박자="".join("✓" if tri.get(k) else "✗" for k in ("crashed", "consolidating", "hl")),
+        현재가=price, 돌파완료=broke,
+        트리거까지=None if (broke or (nxt and nxt["status"] == "지금")) else ((nxt["price"] / price - 1) if (nxt and price) else None),
+        다음차수=(f"{nxt['n']}차" + (" (지금)" if nxt["status"] == "지금" else "") if nxt else "-"),
+        손절선까지=(stop / price - 1) if (stop and price) else None,
+        여력위험비=((target - price) / (price - stop)) if (stop and target and price and target > price > stop) else None,
+        레인지위치=rg.get("pos"), 수요구간=(f"{_fmt_price(zn['lo'])}~{_fmt_price(zn['hi'])}" if zn else "-"),
+        보조필터=sum(bool(x) for x in (ict.get("filters") or {}).values()),
+        이백일선=("-" if mtf.get("state") == "n/a" else
+                ("위" if mtf["gap_pct"] >= 0 else "아래") + ("↗" if mtf["slope_pct"] > 0 else "↘")),
+        수익률1M=_ret_since(df, 30), 수익률3M=_ret_since(df, 91), 거래대금=tv, 비고="",
+        주봉=(lambda m: f"{m['icon']} {m['short']}")(W_STATE_META.get(((ict.get("wict") or {}).get("state")) or "W_NA", W_STATE_META["W_NA"])))
+    row.update(_flow_metrics(df))
+    return row
+
+
+def _yf_batch(tickers, chunk=20):
+    """yfinance 묶음 조회를 chunk개씩 나눠서 실행 (메모리·요청 제한 대비). {티커: 원본 DataFrame}"""
+    frames = {}
+    for i in range(0, len(tickers), chunk):
+        part = tickers[i:i + chunk]
+        try:
+            big = yf.download(part, period="2y", interval="1d", group_by="ticker", progress=False, threads=True, timeout=30)
+        except Exception:
+            continue
+        if big is None or big.empty:
+            continue
+        for t in part:
+            if isinstance(big.columns, pd.MultiIndex):
+                if t in big.columns.get_level_values(0):
+                    frames[t] = big[t].copy()
+            elif len(part) == 1:
+                frames[t] = big.copy()
+        del big
+    return frames
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def scan_market(market):
+    """시장 하나 전체 스캔 (1시간 캐시). 주식은 yfinance 20종목 단위 묶음 조회, 코인은 거래소 순차 조회"""
+    groups = SCREEN_UNIVERSE[market]
+    rows = []
+    if market == "🪙 코인":
+        for sector, items in groups.items():
+            for sym, name in items:
+                try:
+                    df, _src, err = load_crypto(sym, "1일")
+                except Exception as e:
+                    df, err = pd.DataFrame(), type(e).__name__
+                if df is None or df.empty:
+                    rows.append(dict(시장=market, 섹터=sector, 티커=sym, 종목=name, 단계="⚠️ 데이터 오류", 결론="-", 비고=str(err)[:60]))
+                else:
+                    rows.append(screen_row(df, market, sector, sym, name))
+        return rows
+    tickers = [t for items in groups.values() for t, _ in items]
+    frames = _yf_batch(tickers)
+    for sector, items in groups.items():
+        for t, name in items:
+            df, err = pd.DataFrame(), "데이터 없음"
+            try:
+                sub = frames.pop(t, None)                      # 처리한 원본은 바로 버려 메모리 절약
+                if sub is not None:
+                    sub = sub.dropna(subset=[c for c in sub.columns if str(c).lower() == "close"])
+                    if len(sub) >= 120:
+                        df, err = _prep_yf_frame(sub, "1일")
+                    else:
+                        err = f"데이터 부족({len(sub)}봉)"
+            except Exception as e:
+                df, err = pd.DataFrame(), type(e).__name__
+            if df is None or df.empty:
+                rows.append(dict(시장=market, 섹터=sector, 티커=t, 종목=name, 단계="⚠️ 데이터 오류", 결론="-", 비고=str(err)[:60]))
+            else:
+                rows.append(screen_row(df, market, sector, t, name))
+    return rows
+
+
+FLOW_W = {"r3": 0.35, "r1": 0.25, "surge": 0.25, "cmf": 0.15}     # 자금 흐름 점수 가중치 (백분위 순위의 가중 평균)
+FLOW_QUAD = {"주도": "🔥 주도", "약화": "🌗 주도 · 쉬어가는 중", "개선": "🌱 새로 유입", "침체": "🧊 소외"}
+
+
+def _pct_rank(sr):
+    sr = pd.to_numeric(sr, errors="coerce")
+    return sr.rank(pct=True, method="average") * 100
+
+
+def flow_score_frame(df, r3="r3", r1="r1", surge="surge", cmf="cmf"):
+    """여러 그룹(섹터·테마)의 3개월·1개월 수익률, 거래대금 증가, CMF → 백분위 순위의 가중 평균 = 자금 흐름 점수(0~100)
+    국면: 3개월·1개월 순위가 모두 상위 절반 = 주도, 3개월만 상위 = 약화(쉬어가는 중), 1개월만 상위 = 개선(새로 유입), 둘 다 하위 = 침체.
+    순위는 상대값이라 '이 목록 안에서' 어디가 상대적으로 강한지를 뜻합니다 (절대적인 상승·하락이 아님)."""
+    d = df.copy()
+    rk = {k: _pct_rank(d[col]) for k, col in (("r3", r3), ("r1", r1), ("surge", surge), ("cmf", cmf))}
+    num = sum(FLOW_W[k] * rk[k].fillna(50) for k in rk)
+    d["흐름점수"] = num.round(0)
+    q3, q1 = rk["r3"].fillna(50), rk["r1"].fillna(50)
+    d["흐름국면"] = np.where(q3 >= 50, np.where(q1 >= 50, FLOW_QUAD["주도"], FLOW_QUAD["약화"]),
+                         np.where(q1 >= 50, FLOW_QUAD["개선"], FLOW_QUAD["침체"]))
+    d["흐름순위"] = d["흐름점수"].rank(ascending=False, method="min").astype(int)
+    return d
+
+
+def _is_flow_sector(sec):
+    """자금 흐름 순위에 넣을 그룹: 실제 업종만 (지수·레버리지·배당채권 ETF 묶음은 업종이 아니므로 제외)"""
+    return not str(sec).startswith("ETF·") or sec == "ETF·섹터테마"
+
+
+def sector_overview(res):
+    """섹터 한눈에 보기 + 자금 흐름 순위: 3개월·1개월 수익률(중앙값), 거래대금 증가, CMF → 흐름 점수 · 국면"""
+    ok = res[res["단계"] != "⚠️ 데이터 오류"]
+    if ok.empty:
+        return pd.DataFrame()
+    out = []
+    for (mk, sec), g in ok.groupby(["시장", "섹터"], sort=False):
+        cnt = g["국면"].value_counts()
+        num = lambda col: pd.to_numeric(g[col], errors="coerce") if col in g.columns else pd.Series(dtype=float)
+        out.append({
+            "시장": mk, "섹터": sec, "종목수": len(g),
+            "후보": int(g["단계"].isin(CANDIDATE_STAGES).sum()),
+            "🟢매수": int(g["결론"].astype(str).str.startswith("🟢").sum()),
+            "🔵매집": int(cnt.get("매집", 0)), "🟢상승": int(cnt.get("상승", 0)),
+            "🟣분배": int(cnt.get("분배", 0)), "🔴하락": int(cnt.get("하락", 0)),
+            "200일선 위": f"{g['이백일선'].astype(str).str.startswith('위').mean() * 100:.0f}%",
+            "주봉 상승": f"{g['주봉'].astype(str).str.contains('상승|전환').mean() * 100:.0f}%" if "주봉" in g.columns else "-",
+            "평균 1개월": num("수익률1M").median(), "평균 3개월": num("수익률3M").median(),
+            "거래대금 증가": num("거래대금증가").median(), "CMF": num("CMF").median(),
+        })
+    ov = pd.DataFrame(out)
+    fl = ov[ov["섹터"].map(_is_flow_sector)]
+    if len(fl) >= 3:
+        sc = flow_score_frame(fl, "평균 3개월", "평균 1개월", "거래대금 증가", "CMF")
+        ov = ov.join(sc[["흐름점수", "흐름국면", "흐름순위"]])
+    for col in ("흐름점수", "흐름국면", "흐름순위"):
+        if col not in ov.columns:
+            ov[col] = None
+    ov["_k"] = pd.to_numeric(ov["흐름점수"], errors="coerce").fillna(-1)
+    return ov.sort_values(["_k", "후보"], ascending=[False, False]).drop(columns="_k")
+
+
+def _fmt_pct(v, signed=True):
+    if v is None or (isinstance(v, float) and not np.isfinite(v)):
+        return "-"
+    return f"{v * 100:+.1f}%" if signed else f"{v * 100:.1f}%"
+
+
+def _fmt_tv(v, market):
+    if v is None or (isinstance(v, float) and not np.isfinite(v)):
+        return "-"
+    if market == "🇰🇷 국내 (KOSPI)":
+        return f"₩{v / 1e8:,.0f}억"
+    return f"${v / 1e6:,.0f}M"
+
+
+def _fmt_px(v, market):
+    if v is None or (isinstance(v, float) and not np.isfinite(v)):
+        return "-"
+    if market == "🇰🇷 국내 (KOSPI)":
+        return f"₩{v:,.0f}"
+    return f"${v:,.2f}" if v >= 1 else f"${v:,.4f}"
+
+
+# ==========================================
+# 🌊 글로벌 자금 흐름: 섹터·테마·국가·자산 ETF 비교 (모두 달러 기준이라 SPY 대비 상대강도를 바로 비교 가능)
+# ==========================================
+FLOW_UNIVERSE = {
+    "미국 업종": [("XLK", "기술"), ("XLC", "통신·인터넷"), ("XLY", "임의소비"), ("XLP", "필수소비"), ("XLF", "금융"), ("XLV", "헬스케어"),
+              ("XLI", "산업재"), ("XLE", "에너지"), ("XLB", "소재"), ("XLU", "유틸리티"), ("XLRE", "부동산")],
+    "테마": [("SMH", "반도체"), ("IGV", "소프트웨어"), ("CIBR", "사이버보안"), ("BOTZ", "로봇·AI"), ("ITA", "방산·항공우주"),
+           ("UFO", "우주"), ("URA", "우라늄·원자력"), ("NLR", "원자력 발전"), ("GRID", "전력망 인프라"), ("TAN", "태양광"),
+           ("LIT", "2차전지·리튬"), ("XBI", "바이오"), ("KWEB", "중국 인터넷"), ("ARKK", "혁신기술")],
+    "국가": [("SPY", "미국"), ("EWY", "한국"), ("EWJ", "일본"), ("EWT", "대만"), ("FXI", "중국"), ("INDA", "인도"),
+           ("VGK", "유럽"), ("EEM", "신흥국")],
+    "자산": [("TLT", "미국 장기채"), ("IEF", "미국 중기채"), ("GLD", "금"), ("SLV", "은"), ("USO", "원유"), ("UUP", "달러"),
+           ("BTC-USD", "비트코인"), ("ETH-USD", "이더리움")],
+}
+FLOW_BENCH = "SPY"
+# 흐름 테마 → 스크리너 섹터 (흐름이 강한 곳에서 '싸게 살' 종목을 바로 찾기 위한 연결)
+FLOW_TO_SECTORS = {
+    "XLK": ["빅테크", "반도체·AI", "소프트웨어·AI"], "XLC": ["빅테크", "인터넷·게임"], "XLY": ["소비·모빌리티", "자동차"],
+    "XLF": ["금융"], "XLV": ["헬스케어", "바이오"], "XLI": ["전력기기", "조선", "항공우주·우주"], "XLE": ["에너지"],
+    "XLU": ["전력·원전", "원전·유틸리티"], "SMH": ["반도체", "반도체·AI"], "IGV": ["소프트웨어·AI", "인터넷·게임"],
+    "CIBR": ["사이버보안"], "BOTZ": ["반도체·AI", "소프트웨어·AI"], "ITA": ["방산", "방산·항공우주", "항공우주·우주"],
+    "UFO": ["항공우주·우주", "방산·항공우주"], "URA": ["전력·원전", "원전·유틸리티"], "NLR": ["전력·원전", "원전·유틸리티"],
+    "GRID": ["전력기기", "전력·원전"], "LIT": ["2차전지"], "XBI": ["바이오", "헬스케어"],
+    "EWY": ["반도체", "자동차", "조선", "금융"], "BTC-USD": ["대장·메이저 알트"], "ETH-USD": ["대장·메이저 알트"],
+}
+FLOW_PULLBACK_MIN = 60      # '강한 흐름 속 눌림'으로 볼 최소 흐름 점수
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def scan_flow():
+    """FLOW_UNIVERSE 전체를 한 번에 조회해 그룹별 흐름 지표 계산 (1시간 캐시). 실패한 티커는 건너뜀"""
+    items = [(grp, t, n) for grp, lst in FLOW_UNIVERSE.items() for t, n in lst]
+    frames = _yf_batch([t for _, t, _ in items])
+    data = {}
+    for _grp, t, _n in items:
+        sub = frames.pop(t, None)
+        if sub is None:
+            continue
+        try:
+            sub = sub.dropna(subset=[c for c in sub.columns if str(c).lower() == "close"])
+            if len(sub) >= 130:
+                d, _e = _prep_yf_frame(sub, "1일")
+                if d is not None and not d.empty:
+                    data[t] = d
+        except Exception:
+            continue
+    bench = data.get(FLOW_BENCH)
+    b1, b3 = (_ret_since(bench, 30), _ret_since(bench, 91)) if bench is not None else (None, None)
+    rows = []
+    for grp, t, n in items:
+        d = data.get(t)
+        if d is None:
+            rows.append(dict(그룹=grp, 티커=t, 이름=n, 오류=True))
+            continue
+        r1, r3, r6 = _ret_since(d, 30), _ret_since(d, 91), _ret_since(d, 182)
+        rs = lambda r, b: ((1 + r) / (1 + b) - 1) if (r is not None and b is not None) else None
+        fm = _flow_metrics(d)
+        rows.append(dict(그룹=grp, 티커=t, 이름=n, 오류=False, 현재가=float(d["close"].iloc[-1]),
+                         r1=r1, r3=r3, r6=r6, rs1=rs(r1, b1), rs3=rs(r3, b3),
+                         surge=fm["거래대금증가"], cmf=fm["CMF"], d50=fm["오십일선거리"], above200=fm["이백일선위"],
+                         spark=d["close"].tail(130).tolist()))
+    return rows
+
+
+def flow_table(rows):
+    """scan_flow 결과 → 흐름 점수·국면·눌림 여부가 붙은 표 (오류 티커 제외)"""
+    df = pd.DataFrame([r for r in rows if not r.get("오류")])
+    if df.empty:
+        return df
+    df = flow_score_frame(df, "r3", "r1", "surge", "cmf")
+    df["눌림"] = (df["흐름점수"] >= FLOW_PULLBACK_MIN) & df["흐름국면"].isin([FLOW_QUAD["주도"], FLOW_QUAD["약화"]]) & \
+                 (df["above200"].fillna(False).astype(bool)) & \
+                 ((pd.to_numeric(df["r1"], errors="coerce") < 0) | (pd.to_numeric(df["d50"], errors="coerce").abs() <= 0.03))
+    return df.sort_values("흐름점수", ascending=False)
+
+
+# ==========================================
 # 사이드바 네비게이션
 # ==========================================
 st.sidebar.title("🧭 PRO 퀀트 네비게이션")
 tabs = ["🪙 암호화폐 (Crypto)", "📈 국내 주식 (KOSPI)", "🦅 미국 주식 (US Stock)",
-        "📊 미국 ETF (US ETF)", "🥇 금·은 원자재 (Commodities)"]
+        "📊 미국 ETF (US ETF)", "🥇 금·은 원자재 (Commodities)", "🌊 자금 흐름 (Money Flow)", "🔎 스크리너 (Screener)", "💼 포지션 관리 (Position)"]
 market_choice = st.sidebar.radio("트레이딩 룸 선택", tabs)
+
+# ---------- 자금 관리: 결론 배너 · 사다리 · 포지션 관리가 함께 사용 ----------
+st.sidebar.divider()
+st.sidebar.markdown("##### 💰 자금 관리")
+_eq = st.sidebar.number_input("총 투자자산 (원)", min_value=0.0, value=10_000_000.0, step=1_000_000.0, format="%.0f")
+EQUITY = float(_eq) if isinstance(_eq, (int, float)) and _eq > 0 else 10_000_000.0
+st.sidebar.caption(f"1회 허용 손실 {RISK_PER_TRADE:g}% = ₩{EQUITY * RISK_PER_TRADE / 100:,.0f} · 한 종목 최대 {MAX_POSITION_PCT:g}%")
 TF_OPTIONS = ["15분", "1시간", "4시간", "1일", "주봉", "월봉"]
 
 # ---------- 사이드바 하단: 선택한 트레이딩 룸에 맞는 매크로 지표만 표시 ----------
@@ -1375,6 +2877,19 @@ elif market_choice == "🥇 금·은 원자재 (Commodities)":
     _sidebar_krw()
     _macro_metric("달러 인덱스 (DXY)", get_dxy(), "{:.2f}", "{:+.2f}", delta_color="inverse")
 
+elif market_choice == "🌊 자금 흐름 (Money Flow)":
+    _sidebar_krw()
+    _macro_metric("VIX 변동성 지수", get_vix(), "{:.2f}", "{:+.2f}", delta_color="inverse")
+    _macro_metric("달러 인덱스 (DXY)", get_dxy(), "{:.2f}", "{:+.2f}", delta_color="inverse")
+    _macro_metric("미국 10년물 국채 금리", get_us10y(), "{:.2f}%", "{:+.2f}%p", delta_color="inverse")
+
+elif market_choice == "🔎 스크리너 (Screener)":
+    _sidebar_krw()
+    _macro_metric("VIX 변동성 지수", get_vix(), "{:.2f}", "{:+.2f}", delta_color="inverse")
+
+elif market_choice == "💼 포지션 관리 (Position)":
+    _sidebar_krw()
+
 st.sidebar.caption("조회 실패 시 N/A로 표시되며, 국면 점수에는 반영하지 않습니다.")
 
 
@@ -1390,7 +2905,7 @@ if market_choice == "🪙 암호화폐 (Crypto)":
     elif btc_d < 45.0: st.success("🔥 **[알트 시즌]** 도미넌스가 낮아 알트코인으로 자금이 순환될 확률이 높습니다.")
     else: st.info("⚖️ 도미넌스 중립 구간입니다. 개별 차트에 집중하세요.")
 
-    crypto_tabs = ["BTC/USDT", "ETH/USDT", "SOL/USDT", "XRP/USDT", "직접 검색"]
+    crypto_tabs = [t for items in SCREEN_UNIVERSE["🪙 코인"].values() for t, _ in items] + ["직접 검색"]
     selected_crypto = st.radio("관심 심볼", crypto_tabs, horizontal=True)
     target_symbol = st.text_input("심볼 커스텀 입력", value="DOGE/USDT").upper() if selected_crypto == "직접 검색" else selected_crypto.split(" ")[0]
 
@@ -1406,7 +2921,7 @@ if market_choice == "🪙 암호화폐 (Crypto)":
         htf_df = load_htf_safe(lambda tf: load_crypto(target_symbol, tf), UPPER_TF.get(selected_tf))
         render_dashboard_safe(df, c1, c2, show_hist, rate_text=KRW_RATE, rate_chart=1.0,
                               captions=(f"데이터 소스: {source} · 환율: {KRW_SRC}",), tf_label=selected_tf, htf=htf_df,
-                              macro={"fng": fng["value"] if fng else None})
+                              macro={"fng": fng["value"] if fng else None}, qty_dec=4)
 
 # ==========================================
 # 2. 📈 국내 주식 (KOSPI) 마켓
@@ -1414,13 +2929,7 @@ if market_choice == "🪙 암호화폐 (Crypto)":
 elif market_choice == "📈 국내 주식 (KOSPI)":
     st.title("📈 KOSPI 주도주 현물 매수 봇")
 
-    kospi_sectors = {
-        "반도체": ["005930.KS (삼성전자)", "000660.KS (SK하이닉스)", "042700.KS (한미반도체)", "000990.KS (DB하이텍)", "058470.KQ (리노공업)"],
-        "2차전지": ["373220.KS (LG엔솔)", "005490.KS (POSCO홀딩스)", "006400.KS (삼성SDI)", "247540.KQ (에코프로비엠)", "051910.KS (LG화학)"],
-        "바이오": ["207940.KS (삼성바이오)", "068270.KS (셀트리온)", "000100.KS (유한양행)", "326030.KS (SK바이오팜)", "128940.KS (한미약품)"],
-        "인터넷/게임": ["035420.KS (NAVER)", "035720.KS (카카오)", "259960.KS (크래프톤)", "036570.KS (엔씨소프트)", "251270.KS (넷마블)"],
-        "자동차": ["005380.KS (현대차)", "000270.KS (기아)", "012330.KS (현대모비스)", "204320.KS (HL만도)", "018880.KS (한온시스템)"]
-    }
+    kospi_sectors = tab_groups("🇰🇷 국내 (KOSPI)")      # 스크리너와 같은 목록 (SCREEN_UNIVERSE)
 
     vols = get_sector_volumes(kospi_sectors)
     if sum(vols.values()) > 0:
@@ -1454,13 +2963,7 @@ elif market_choice == "📈 국내 주식 (KOSPI)":
 elif market_choice == "🦅 미국 주식 (US Stock)":
     st.title("🦅 미국 주식 주도주 퀀트 봇")
 
-    us_sectors = {
-        "테크/소프트웨어": ["AAPL (애플)", "MSFT (마이크로소프트)", "GOOGL (구글)", "META (메타)", "AMZN (아마존)"],
-        "반도체/AI": ["NVDA (엔비디아)", "TSM (TSMC)", "AVGO (브로드컴)", "AMD (AMD)", "QCOM (퀄컴)"],
-        "금융/핀테크": ["JPM (JP모건)", "V (비자)", "MA (마스터카드)", "BAC (뱅크오브아메리카)", "WFC (웰스파고)"],
-        "헬스케어": ["LLY (일라이릴리)", "UNH (유나이티드헬스)", "JNJ (존슨앤존슨)", "ABBV (애브비)", "MRK (머크)"],
-        "전기차/에너지": ["TSLA (테슬라)", "XOM (엑슨모빌)", "CVX (쉐브론)", "NEE (넥스테라)", "COP (코노코필립스)"]
-    }
+    us_sectors = tab_groups("🇺🇸 미국", etf=False)      # 스크리너와 같은 목록 (ETF 그룹은 ETF 탭에)
 
     vols = get_sector_volumes(us_sectors)
     if sum(vols.values()) > 0:
@@ -1496,17 +2999,14 @@ elif market_choice == "🦅 미국 주식 (US Stock)":
 elif market_choice == "📊 미국 ETF (US ETF)":
     st.title("📊 미국 ETF 퀀트 봇")
 
-    etf_groups = {
-        "시장 지수": ["SPY (S&P 500)", "QQQ (나스닥 100)", "DIA (다우존스)", "IWM (러셀 2000)"],
-        "섹터/테마": ["SOXX (반도체)", "XLK (기술주)", "XLF (금융)", "XLV (헬스케어)"],
-        "배당/가치": ["SCHD (배당성장)", "VYM (고배당)", "VTV (가치주)"],
-        "채권/안전자산": ["TLT (미 국채 20년+)", "IEF (미 국채 7-10년)", "GLD (금)"],
-    }
+    etf_groups = tab_groups("🇺🇸 미국", etf=True)       # 스크리너와 같은 목록 (SCREEN_UNIVERSE의 ETF 그룹)
 
     sel_grp = st.selectbox("📂 ETF 카테고리", list(etf_groups.keys()))
     sel_tick = st.radio(f"🏆 {sel_grp}", etf_groups[sel_grp], horizontal=True).split(" ")[0]
-    if sel_grp == "채권/안전자산":
+    if "채권" in sel_grp and sel_tick in ("TLT", "IEF"):
         st.caption("ℹ️ 채권 ETF는 금리와 반대로 움직입니다. 수급 기반 국면 판별의 해석이 주식과 다를 수 있으니 참고용으로만 보세요.")
+    if "레버리지" in sel_grp:
+        st.warning("⚠️ 레버리지 ETF는 하루 변동의 3배로 움직이고, 횡보장에서는 가치가 깎입니다(변동성 손실). 단기·소액으로만 다루세요.")
 
     c1, c2 = st.columns([1.3, 2])
     with c2:
@@ -1543,3 +3043,454 @@ elif market_choice == "🥇 금·은 원자재 (Commodities)":
         render_dashboard_safe(df, c1, c2, show_hist, rate_text=KRW_RATE, rate_chart=KRW_RATE, is_commodity=True,
                               captions=(f"환율 적용: 1 USD = {KRW_RATE:,.0f} KRW ({KRW_SRC}) · 온스당",),
                               tf_label=selected_tf, htf=htf_df)
+
+# ==========================================
+# 6. 🔎 스크리너 (한눈에 보기 → 후보 선별 → 심층 분석)
+# ==========================================
+elif market_choice == "🔎 스크리너 (Screener)":
+    st.title("🔎 섹터·종목 스크리너")
+    st.caption("① 섹터 흐름을 한눈에 보고 → ② 매집이 유효한 후보만 추린 뒤 → ③ 기존 대시보드로 심층 분석합니다. "
+               "판정은 다른 탭과 같은 엔진(일봉)을 쓰며, 상위 프레임(MTF) 필터는 ③ 심층 분석에서 확인합니다.")
+
+    mk_all = list(SCREEN_UNIVERSE.keys())
+    n_all = {m: sum(len(v) for v in SCREEN_UNIVERSE[m].values()) for m in mk_all}
+    s1, s2 = st.columns([3, 1])
+    with s1:
+        markets = st.multiselect("스캔할 시장", mk_all, default=mk_all, format_func=lambda m: f"{m} ({n_all[m]}종목)")
+    with s2:
+        st.write("")
+        run = st.button("🔄 스캔 시작", type="primary")
+    st.caption("결과는 1시간 동안 저장됩니다. 처음 스캔은 1~2분 걸릴 수 있습니다.")
+
+    if "scan_rows" not in st.session_state:
+        st.session_state["scan_rows"], st.session_state["scan_markets"] = None, []
+    if run and markets:
+        rows = []
+        prog = st.progress(0.0, text="스캔 준비 중...")
+        for i, m in enumerate(markets):
+            prog.progress(i / len(markets), text=f"{m} 스캔 중... ({i + 1}/{len(markets)})")
+            try:
+                rows += scan_market(m)
+            except Exception as e:
+                st.warning(f"{m} 스캔 실패 ({type(e).__name__}) — 나머지 시장은 계속 진행합니다.")
+        prog.progress(1.0, text="스캔 완료")
+        st.session_state["scan_rows"], st.session_state["scan_markets"] = rows, markets
+        st.session_state["scan_time"] = pd.Timestamp.now(tz="Asia/Seoul").strftime("%Y-%m-%d %H:%M")
+
+    rows = st.session_state.get("scan_rows")
+    if not rows:
+        st.info("시장을 고르고 **🔄 스캔 시작**을 누르세요.")
+    else:
+        res = pd.DataFrame(rows)
+        for col in ("결론", "국면", "국면점수", "매집점수", "진바닥3박자", "현재가", "돌파완료", "트리거까지", "다음차수", "손절선까지",
+                    "여력위험비", "레인지위치", "수요구간", "보조필터", "이백일선", "수익률1M", "수익률3M", "거래대금", "비고",
+                    "주봉", "거래대금증가", "CMF", "오십일선거리", "이백일선위"):
+            if col not in res.columns:
+                res[col] = None
+        res["_ord"] = res["단계"].map({s: i for i, s in enumerate(STAGE_ORDER)}).fillna(99)
+        bad = res[res["단계"] == "⚠️ 데이터 오류"]
+        st.caption(f"스캔 시각 {st.session_state.get('scan_time', '')} · {len(res)}종목 중 {len(res) - len(bad)}종목 판정"
+                   + (f" · 데이터 오류 {len(bad)}종목 (맨 아래 전체 결과에서 확인)" if len(bad) else ""))
+
+        # ---------- ① 섹터 자금 흐름 순위 ----------
+        st.subheader("① 섹터 자금 흐름 순위 (돈이 몰리는 순)")
+        ov = sector_overview(res)
+        if ov.empty:
+            st.warning("판정된 종목이 없습니다.")
+        else:
+            show = pd.DataFrame({
+                "순위": ov["흐름순위"].map(lambda v: "-" if v is None or not np.isfinite(v) else f"{int(v)}위"),
+                "시장": ov["시장"], "섹터": ov["섹터"],
+                "흐름 점수": ov["흐름점수"].map(lambda v: "-" if v is None or not np.isfinite(v) else f"{v:.0f}"),
+                "흐름 국면": ov["흐름국면"].fillna("-"),
+                "3개월(중앙값)": ov["평균 3개월"].map(_fmt_pct), "1개월(중앙값)": ov["평균 1개월"].map(_fmt_pct),
+                "거래대금 증가": ov["거래대금 증가"].map(_fmt_pct),
+                "CMF": ov["CMF"].map(lambda v: "-" if v is None or not np.isfinite(v) else f"{v:+.2f}"),
+                "200일선 위": ov["200일선 위"], "주봉 상승·전환": ov["주봉 상승"],
+                "후보": ov["후보"], "🟢매수": ov["🟢매수"], "종목수": ov["종목수"],
+            })
+            st.dataframe(show, hide_index=True, width="stretch")
+            st.caption(f"흐름 점수 = 스캔한 섹터들 사이의 백분위 순위 가중 평균 (3개월 수익률 {FLOW_W['r3']:.0%} · 1개월 {FLOW_W['r1']:.0%} · "
+                       f"거래대금 증가 {FLOW_W['surge']:.0%} · CMF {FLOW_W['cmf']:.0%}, 섹터 안 종목들의 중앙값). "
+                       "🔥 주도 = 길게도 짧게도 강함 · 🌗 쉬어가는 중 = 강했는데 최근 눌림(가장 노릴 만한 곳) · 🌱 새로 유입 · 🧊 소외. "
+                       "지수·레버리지·배당채권 ETF 묶음은 업종이 아니라 순위에서 뺐습니다. 국가·자산까지 포함한 큰 흐름은 🌊 자금 흐름 탭에서 보세요.")
+
+        # ---------- ② 매집 유효 후보 ----------
+        st.subheader("② 무릎 매수 후보")
+        f1, f3 = st.columns([3, 1])
+        with f1:
+            stages = st.multiselect("단계 (위에서부터 우선순위)", CANDIDATE_STAGES, default=CANDIDATE_STAGES)
+        with f3:
+            st.write("")
+            no_lev = st.checkbox("레버리지 ETF 제외", value=True)
+        cand = res[res["단계"].isin(stages or [])].copy()
+        if no_lev:
+            cand = cand[cand["섹터"] != "ETF·레버리지(3x)"]
+        # 정렬: 단계 우선순위 → 섹터 자금 흐름 순위 → 여력/위험(손익비) → 거래대금 (검증되지 않은 매집 점수는 정렬에 쓰지 않음)
+        fmap = {} if ov.empty else {(m_, s_): (r_, q_, sc_) for m_, s_, r_, q_, sc_ in
+                                    zip(ov["시장"], ov["섹터"], ov["흐름순위"], ov["흐름국면"], ov["흐름점수"])}
+        n_sec = max([v[0] for v in fmap.values() if v[0] is not None and np.isfinite(v[0])] or [1])
+        cand["_frank"] = [fmap.get((m_, s_), (None,))[0] for m_, s_ in zip(cand["시장"], cand["섹터"])]
+        cand["_frank"] = pd.to_numeric(cand["_frank"], errors="coerce").fillna(n_sec + 1)
+        cand["_rr"] = pd.to_numeric(cand["여력위험비"], errors="coerce").fillna(-1)
+        cand["_tv"] = pd.to_numeric(cand["거래대금"], errors="coerce").fillna(0)
+        cand = cand.sort_values(["_ord", "_frank", "_rr", "_tv"], ascending=[True, True, False, False])
+        flow_txt = lambda m_, s_: (lambda v: "-" if v is None or v[0] is None or not np.isfinite(v[0]) else f"{int(v[0])}위 {v[1]}")(fmap.get((m_, s_)))
+
+        # ---------- 🏆 추천: 돈이 몰리는 섹터 안의 무릎 매수 후보 ----------
+        top_cut = max(3, int(np.ceil(n_sec / 3)))
+        rec = cand[(cand["_frank"] <= top_cut) & (~cand["결론"].astype(str).str.startswith("🔴"))].head(10)
+        st.markdown(f"##### 🏆 추천 (자금 흐름 상위 {top_cut}개 섹터 안의 후보)")
+        if rec.empty:
+            st.info("흐름 상위 섹터에서 아직 무릎 매수 후보가 없습니다. 강한 섹터는 대개 이미 올라 있어서, 눌림이 올 때까지 기다리는 게 맞습니다.")
+        else:
+            for i, (_, r_) in enumerate(rec.iterrows(), 1):
+                st.markdown(f"{i}. **{r_['종목']}** ({r_['티커']}) · {r_['섹터']} — 섹터 흐름 {flow_txt(r_['시장'], r_['섹터'])} · "
+                            f"{r_['결론']} · {r_['단계']} · 주봉 {r_.get('주봉', '-')} · 레인지 위치 "
+                            + ("-" if r_.get("레인지위치") is None or not np.isfinite(r_["레인지위치"]) else f"{r_['레인지위치'] * 100:.0f}%")
+                            + f" · 손절선까지 {_fmt_pct(r_['손절선까지'])}")
+            st.caption("순서: 단계(🟢 매수 실행 > 대기 > 관찰) → 섹터 흐름 순위 → 여력/위험. 같은 섹터에서 여러 개면 하나만 고르세요. "
+                       "주봉이 🔴 하락이면 사다리 리스크가 절반으로 줄어듭니다.")
+        if cand.empty:
+            st.info("조건에 맞는 후보가 없습니다. 하락장에서는 후보가 없는 게 정상일 수 있습니다 — 억지로 찾지 마세요.")
+        else:
+            view = pd.DataFrame({
+                "결론": cand["결론"], "단계": cand["단계"], "종목": cand["종목"] + " (" + cand["티커"] + ")", "섹터": cand["섹터"],
+                "섹터 흐름": [flow_txt(m_, s_) for m_, s_ in zip(cand["시장"], cand["섹터"])],
+                "주봉 추세": cand["주봉"].fillna("-"),
+                "3박자(이탈·수축·HL)": cand["진바닥3박자"],
+                "현재가": [_fmt_px(v, m) for v, m in zip(cand["현재가"], cand["시장"])],
+                "다음 매수가까지": [("지금" if "(지금)" in str(nx) else "돌파 완료" if (b_ and (v is None or not np.isfinite(v))) else _fmt_pct(v))
+                                for b_, v, nx in zip(cand["돌파완료"].fillna(False), cand["트리거까지"], cand["다음차수"])],
+                "다음 차수": cand["다음차수"].fillna("-"),
+                "손절선까지": cand["손절선까지"].map(_fmt_pct),
+                "레인지 위치": cand["레인지위치"].map(lambda v: "-" if v is None or not np.isfinite(v) else f"{v * 100:.0f}%"),
+                "주봉 수요 구간": cand["수요구간"].fillna("-"),
+                "보조필터": cand["보조필터"].fillna(0).astype(int).astype(str) + "/7",
+                "여력/위험(배)": cand["여력위험비"].map(lambda v: "-" if v is None or not np.isfinite(v) else f"{v:.1f}"),
+                "200일선": cand["이백일선"], "거래대금(20일)": [_fmt_tv(v, m) for v, m in zip(cand["거래대금"], cand["시장"])],
+                "1개월": cand["수익률1M"].map(_fmt_pct),
+                "국면(참고)": cand["국면"] + " " + cand["국면점수"].fillna(0).astype(int).astype(str) + "점",
+            })
+            st.dataframe(view, hide_index=True, width="stretch")
+            st.caption("· 손절선 = ICT 사다리의 공통 무효화 손절 (스윕 저점 − 0.25 ATR, 스윕 전이면 예상값) · "
+                       "여력/위험 = (목표 − 현재가) ÷ (현재가 − 손절선), 목표는 돌파 전이면 돌파선(IBSL), 돌파 후면 다음 매물대 저항 · "
+                       "레인지 위치 = 최근 52주 범위에서의 위치 (50% 아래가 할인 구간) · 주봉 추세 🔴 하락(주봉 CHoCH 전)이면 리스크 절반")
+            st.caption("· 🟢는 ICT 사다리 단계(1차 스윕 후 회복 · 2차 CHoCH · 3차 리테스트)에서만 나옵니다. 상세 판단은 ③ 심층 분석(1일)에서 확인하세요.")
+            dup = cand["섹터"].value_counts()
+            dup = dup[dup >= 2]
+            if len(dup):
+                st.warning("같은 섹터에서 후보가 여러 개입니다: " + ", ".join(f"{s} {n}개" for s, n in dup.items())
+                           + " — 같은 섹터는 사실상 같은 베팅이니 하나만 고르세요.")
+            if (cand["섹터"] == "ETF·레버리지(3x)").any():
+                st.warning("레버리지 ETF는 횡보장에서 가치가 깎이고(변동성 손실) 하루 만에 크게 움직입니다. 단기·소액으로만 다루세요.")
+
+        with st.expander("📋 전체 결과 (모든 단계) · CSV 저장", expanded=False):
+            allv = res.sort_values(["_ord", "시장", "섹터"]).drop(columns=[c for c in ("_ord", "_rr", "_tv", "_frank") if c in res.columns])
+            st.dataframe(allv, hide_index=True, width="stretch")
+            st.download_button("⬇️ 오늘 스캔 결과 CSV로 저장 (나중에 성과 확인용)",
+                               allv.to_csv(index=False).encode("utf-8-sig"),
+                               file_name=f"screen_{st.session_state.get('scan_time', '')[:10]}.csv", mime="text/csv")
+
+        # ---------- ③ 심층 분석 ----------
+        st.subheader("③ 심층 분석")
+        pool = cand if not cand.empty else res[res["단계"] != "⚠️ 데이터 오류"]
+        if st.checkbox("후보가 아닌 종목도 목록에 보기", value=cand.empty):
+            pool = res[res["단계"] != "⚠️ 데이터 오류"].sort_values(["_ord", "시장", "섹터"])
+        if pool.empty:
+            st.info("분석할 종목이 없습니다.")
+        else:
+            opts = list(zip(pool["시장"], pool["티커"], pool["종목"], pool["단계"], pool["결론"].fillna("-")))
+            pick = st.selectbox("종목 선택", opts, format_func=lambda o: f"{o[4]} · {o[3]} · {o[2]} ({o[1]}) · {o[0]}")
+            p_mk, p_tk, p_nm = pick[0], pick[1], pick[2]
+            st.markdown(f"#### {p_nm} ({p_tk})")
+            c1, c2 = st.columns([1.3, 2])
+            with c2:
+                selected_tf = st.radio("프레임 선택", TF_OPTIONS, index=3, horizontal=True, key="scr_tf")
+                show_hist = st.checkbox("과거 국면 표시 (검증용)", key="scr_hist")
+            if p_mk == "🪙 코인":
+                df, source, err = load_crypto(p_tk, selected_tf)
+                if df.empty:
+                    st.error(f"데이터 로드 실패 → {err}")
+                else:
+                    htf_df = load_htf_safe(lambda tf: load_crypto(p_tk, tf), UPPER_TF.get(selected_tf))
+                    render_dashboard_safe(df, c1, c2, show_hist, rate_text=KRW_RATE, rate_chart=1.0,
+                                          captions=(f"데이터 소스: {source} · 환율: {KRW_SRC}",), tf_label=selected_tf,
+                                          htf=htf_df, qty_dec=4)
+            else:
+                df, err = load_yf_cached(p_tk, selected_tf)
+                if df.empty:
+                    st.error(f"데이터 로드 실패 → {err}")
+                else:
+                    rate = 1.0 if p_mk == "🇰🇷 국내 (KOSPI)" else KRW_RATE
+                    caps = () if rate == 1.0 else (f"환율 적용: 1 USD = {KRW_RATE:,.0f} KRW ({KRW_SRC})",)
+                    htf_df = load_htf_safe(lambda tf: load_yf_cached(p_tk, tf), UPPER_TF.get(selected_tf))
+                    render_dashboard_safe(df, c1, c2, show_hist, rate_text=rate, rate_chart=rate, captions=caps,
+                                          tf_label=selected_tf, htf=htf_df)
+
+# ==========================================
+# 6-0. 🌊 글로벌 자금 흐름 (어디로 돈이 몰리는가 → 그 안에서 싸게 살 곳)
+# ==========================================
+elif market_choice == "🌊 자금 흐름 (Money Flow)":
+    st.title("🌊 글로벌 자금 흐름")
+    st.caption("업종 · 테마 · 국가 · 자산 ETF를 같은 달러 기준으로 비교해 큰돈이 어디로 움직이는지 봅니다. "
+               "흐름이 강한 곳을 고른 뒤, 그 안에서 **눌림(할인 구간 · 수요 구간)** 에 온 종목을 스크리너와 종목 화면에서 찾습니다.")
+    try:
+        with st.spinner("ETF 데이터를 불러오는 중... (1시간 저장)"):
+            frows = scan_flow()
+        ft = flow_table(frows)
+    except Exception as e:
+        frows, ft = [], pd.DataFrame()
+        st.error(f"자금 흐름 데이터를 불러오지 못했습니다 ({type(e).__name__}). 잠시 뒤 다시 시도하세요.")
+    if ft is None or ft.empty:
+        st.info("표시할 데이터가 없습니다.")
+    else:
+        miss = [r["티커"] for r in frows if r.get("오류")]
+        bench = ft[ft["티커"] == FLOW_BENCH]
+        lead = ft[ft["흐름국면"] == FLOW_QUAD["주도"]]
+        k1, k2, k3, k4 = st.columns(4)
+        top = ft.iloc[0]
+        k1.metric("가장 강한 흐름", f"{top['이름']} ({top['티커']})", f"점수 {top['흐름점수']:.0f}", delta_color="off")
+        k2.metric("🔥 주도 그룹 수", f"{len(lead)}개 / {len(ft)}개")
+        if not bench.empty:
+            k3.metric("기준: S&P500 3개월", _fmt_pct(bench.iloc[0]["r3"]), f"1개월 {_fmt_pct(bench.iloc[0]['r1'])}", delta_color="off")
+        risk_on = ft[ft["티커"].isin(["SMH", "XLK", "ARKK", "BTC-USD"])]["흐름점수"].mean()
+        risk_off = ft[ft["티커"].isin(["TLT", "GLD", "XLU", "XLP", "UUP"])]["흐름점수"].mean()
+        if np.isfinite(risk_on) and np.isfinite(risk_off):
+            k4.metric("위험 선호 (성장 − 방어)", f"{risk_on - risk_off:+.0f}점",
+                      "성장·위험자산 쪽으로 쏠림" if risk_on > risk_off + 10 else "방어자산 쪽으로 쏠림" if risk_off > risk_on + 10 else "뚜렷한 쏠림 없음",
+                      delta_color="off")
+
+        # ---------- ① 흐름 순위 ----------
+        st.subheader("① 자금 흐름 순위")
+        grp_pick = st.radio("보기", ["전체"] + list(FLOW_UNIVERSE.keys()), horizontal=True, key="flow_grp")
+        fv = ft if grp_pick == "전체" else ft[ft["그룹"] == grp_pick]
+        try:
+            topn = fv.head(15).iloc[::-1]
+            fig = go.Figure(data=[go.Bar(x=topn["흐름점수"], y=topn["이름"] + " (" + topn["티커"] + ")", orientation="h",
+                                         marker_color=["#e53935" if q == FLOW_QUAD["주도"] else "#fb8c00" if q == FLOW_QUAD["약화"]
+                                                       else "#43a047" if q == FLOW_QUAD["개선"] else "#90a4ae" for q in topn["흐름국면"]],
+                                         text=topn["흐름국면"], textposition="inside")])
+            fig.update_layout(height=max(320, 26 * len(topn)), margin=dict(l=10, r=10, t=10, b=10), xaxis_title="흐름 점수 (0~100)",
+                              template="plotly_dark", xaxis=dict(range=[0, 100]))
+            st.plotly_chart(fig, width="stretch")
+        except Exception:
+            pass
+        tbl = pd.DataFrame({
+            "순위": fv["흐름순위"], "그룹": fv["그룹"], "이름": fv["이름"] + " (" + fv["티커"] + ")",
+            "흐름 점수": fv["흐름점수"].astype(int), "국면": fv["흐름국면"],
+            "1개월": fv["r1"].map(_fmt_pct), "3개월": fv["r3"].map(_fmt_pct), "6개월": fv["r6"].map(_fmt_pct),
+            "S&P 대비 3개월": fv["rs3"].map(_fmt_pct), "S&P 대비 1개월": fv["rs1"].map(_fmt_pct),
+            "거래대금 증가": fv["surge"].map(_fmt_pct), "CMF(매집 압력)": fv["cmf"].map(lambda v: "-" if v is None or not np.isfinite(v) else f"{v:+.2f}"),
+            "50일선 대비": fv["d50"].map(_fmt_pct), "200일선": fv["above200"].map(lambda b: "위" if b is True else "아래" if b is False else "-"),
+            "강한 흐름 속 눌림": fv["눌림"].map(lambda b: "🎯" if b else ""),
+            "추세(6개월)": fv["spark"],
+        })
+        try:
+            st.dataframe(tbl, hide_index=True, width="stretch",
+                         column_config={"추세(6개월)": st.column_config.LineChartColumn("추세(6개월)"),
+                                        "흐름 점수": st.column_config.ProgressColumn("흐름 점수", min_value=0, max_value=100, format="%d")})
+        except Exception:
+            st.dataframe(tbl.drop(columns=["추세(6개월)"]), hide_index=True, width="stretch")
+        st.caption(f"흐름 점수 = 이 목록 안에서의 백분위 순위를 가중 평균 (3개월 수익률 {FLOW_W['r3']:.0%} · 1개월 {FLOW_W['r1']:.0%} · "
+                   f"거래대금 증가 {FLOW_W['surge']:.0%} · CMF {FLOW_W['cmf']:.0%}). 국면: 🔥 주도 = 3개월·1개월 모두 상위 절반 · "
+                   "🌗 쉬어가는 중 = 3개월은 강한데 최근 1개월이 약함(눌림 후보) · 🌱 새로 유입 = 최근 1개월만 강함 · 🧊 소외 = 둘 다 약함. "
+                   "거래대금 증가 = 최근 20일 평균 ÷ 그 전 120일 평균 − 1 · CMF = 종가가 하루 범위 위쪽에서 끝난 날의 거래량 비중(+면 매수 우위).")
+        if miss:
+            st.caption("조회 실패로 빠진 티커: " + ", ".join(miss))
+
+        # ---------- ② 순환 지도 ----------
+        st.subheader("② 순환 지도 (3개월 강도 × 최근 1개월 강도)")
+        try:
+            sc = ft.dropna(subset=["rs3", "rs1"])
+            fig2 = go.Figure()
+            for q, col in ((FLOW_QUAD["주도"], "#e53935"), (FLOW_QUAD["약화"], "#fb8c00"), (FLOW_QUAD["개선"], "#43a047"), (FLOW_QUAD["침체"], "#90a4ae")):
+                g = sc[sc["흐름국면"] == q]
+                if not g.empty:
+                    fig2.add_trace(go.Scatter(x=g["rs3"] * 100, y=g["rs1"] * 100, mode="markers+text", name=q, text=g["이름"],
+                                              textposition="top center", marker=dict(size=11, color=col)))
+            fig2.add_hline(y=0, line_dash="dot", line_color="#888")
+            fig2.add_vline(x=0, line_dash="dot", line_color="#888")
+            fig2.update_layout(height=520, template="plotly_dark", margin=dict(l=10, r=10, t=10, b=10),
+                               xaxis_title="S&P500 대비 3개월 (%)", yaxis_title="S&P500 대비 1개월 (%)")
+            st.plotly_chart(fig2, width="stretch")
+            st.caption("오른쪽 위 = 길게도 짧게도 강한 곳(주도) · 오른쪽 아래 = 강했지만 최근 쉬는 곳(눌림 매수를 노릴 곳) · "
+                       "왼쪽 위 = 새로 돈이 들어오기 시작한 곳 · 왼쪽 아래 = 소외. 보통 시계 반대 방향(개선 → 주도 → 약화 → 침체)으로 돕니다.")
+        except Exception:
+            st.caption("순환 지도를 그리지 못했습니다.")
+
+        # ---------- ③ 흐름 → 싸게 살 곳 ----------
+        st.subheader("③ 흐름이 강한 곳에서 싸게 살 곳 찾기")
+        pb = ft[ft["눌림"]]
+        if pb.empty:
+            st.info(f"지금은 '흐름 점수 {FLOW_PULLBACK_MIN}점 이상 · 3개월 강도 상위 · 200일선 위 · 최근 1개월 하락 또는 50일선 ±3% 이내'인 눌림 그룹이 없습니다. "
+                    "강한 곳은 이미 많이 올랐거나, 쉬는 곳은 추세가 꺾인 상태입니다 — 추격하지 말고 눌림을 기다리세요.")
+        else:
+            st.success("🎯 강한 흐름 속 눌림: " + " · ".join(f"**{r['이름']}**({r['티커']}, {r['흐름점수']:.0f}점, 1개월 {_fmt_pct(r['r1'])})"
+                                                      for _, r in pb.iterrows()))
+        hot = ft[(ft["흐름점수"] >= FLOW_PULLBACK_MIN) & ft["티커"].isin(FLOW_TO_SECTORS.keys())]
+        secs = []
+        for _, r in hot.iterrows():
+            for sname in FLOW_TO_SECTORS[r["티커"]]:
+                if sname not in secs:
+                    secs.append(sname)
+        if secs:
+            st.markdown("**흐름이 강한 테마와 연결된 스크리너 섹터**: " + " · ".join(secs))
+        rows_sc = st.session_state.get("scan_rows")
+        if rows_sc and secs:
+            rs_df = pd.DataFrame(rows_sc)
+            if "섹터" in rs_df.columns and "단계" in rs_df.columns:
+                cc = rs_df[rs_df["섹터"].isin(secs) & rs_df["단계"].isin(CANDIDATE_STAGES)].copy()
+                if cc.empty:
+                    st.info("마지막 스크리너 결과에서 이 섹터들의 매수 후보는 없습니다. (강한 섹터가 아직 눌리지 않았다는 뜻일 수 있습니다)")
+                else:
+                    cc["_ord"] = cc["단계"].map({x: i for i, x in enumerate(STAGE_ORDER)}).fillna(99)
+                    cc = cc.sort_values("_ord")
+                    st.dataframe(pd.DataFrame({"결론": cc["결론"], "단계": cc["단계"], "종목": cc["종목"] + " (" + cc["티커"] + ")",
+                                               "섹터": cc["섹터"], "레인지 위치": cc.get("레인지위치", pd.Series(dtype=float)).map(
+                                                   lambda v: "-" if v is None or not np.isfinite(v) else f"{v * 100:.0f}%"),
+                                               "주봉": cc.get("주봉", "-")}), hide_index=True, width="stretch")
+                    st.caption(f"마지막 스크리너 스캔({st.session_state.get('scan_time', '')}) 기준. 상세 판단은 🔎 스크리너 ③ 심층 분석에서 확인하세요.")
+        elif secs:
+            st.info("🔎 스크리너 탭에서 스캔을 한 번 돌리면, 여기서 이 섹터들의 매수 후보를 바로 보여줍니다.")
+        st.caption("※ '저평가'는 재무 지표가 아니라 기술적 위치(눌림 · 할인 구간 · 수요 구간)를 뜻합니다. "
+                   "흐름 점수는 과거 수익률 기반이라 방향이 바뀌는 시점은 늦게 잡힙니다 — 순위는 '어디를 볼지'를 정하는 용도로 쓰세요.")
+
+# ==========================================
+# 7. 💼 포지션 관리 (손절 · 추가 매수 · 익절 · 매도를 한 화면에서)
+# ==========================================
+elif market_choice == "💼 포지션 관리 (Position)":
+    st.title("💼 포지션 관리")
+    st.caption("이미 산 종목 하나를 넣으면 지금 할 일(손절 · 추가 매수 · 익절 · 보유)과 손절가, 손절 시 손실 금액을 계산합니다. "
+               "새로 살 계획은 각 종목 화면의 🪜 사다리에서, 산 뒤의 관리는 이 탭에서 합니다. (일봉 기준, 장 마감 후 확인 권장)")
+
+    s1, s2 = st.columns([1, 2])
+    with s1:
+        mk = st.selectbox("시장", list(SCREEN_UNIVERSE.keys()), key="pos_mk")
+    with s2:
+        opts = [f"{t} ({n})" for items in SCREEN_UNIVERSE[mk].values() for t, n in items] + ["직접 입력"]
+        pick = st.selectbox("보유 종목", opts, key="pos_pick")
+    tk = (st.text_input("티커 직접 입력 (예: 005930.KS, AAPL, BTC/USDT)", value="", key="pos_tk") or "").strip().upper() \
+        if pick == "직접 입력" else pick.split(" ")[0]
+    is_kr, is_coin = mk == "🇰🇷 국내 (KOSPI)", mk == "🪙 코인"
+    unit = "원" if is_kr else ("USDT" if is_coin else "달러")
+    qdec = 4 if is_coin else 0
+    fx = 1.0 if is_kr else KRW_RATE
+
+    a1, a2 = st.columns(2)
+    with a1:
+        avg_px = st.number_input(f"평단가 ({unit})", min_value=0.0, value=0.0, step=1.0 if is_kr else 0.01,
+                                 format="%.0f" if is_kr else "%.4f", key="sell_avg")
+    with a2:
+        qty = st.number_input("보유 수량", min_value=0.0, value=0.0, step=1.0 if qdec == 0 else 0.0001,
+                              format="%.0f" if qdec == 0 else "%.4f", key="sell_qty")
+    b1, b2 = st.columns([2, 1])
+    with b1:
+        mode = st.radio("어떻게 샀나요?", POS_MODES, index=0, horizontal=True, key="pos_mode")
+    with b2:
+        st.write("")
+        tp1_done = st.checkbox("1차 익절(50%) 이미 함", value=False, key="pos_tp1")
+    bought = 0 if mode == POS_MODES[3] else POS_MODES.index(mode) + 1
+    avg_px = avg_px if isinstance(avg_px, (int, float)) else 0.0
+    qty = qty if isinstance(qty, (int, float)) else 0.0
+    tp1_done = bool(tp1_done)
+
+    if not tk:
+        st.info("티커를 입력하세요.")
+    else:
+        if is_coin:
+            df, _src, err = load_crypto(tk, "1일")
+        else:
+            df, err = load_yf_cached(tk, "1일")
+        if df is None or df.empty:
+            st.error(f"⛔ 데이터 로드 실패 → {err}")
+        elif avg_px <= 0 or qty <= 0:
+            st.info(f"현재가 {_fmt_price(float(df['close'].iloc[-1]))} {unit} · 평단가와 보유 수량을 입력하면 관리 계획을 계산합니다.")
+        else:
+            try:
+                sug, sug_src = position_suggest_stop(df, avg_px, qty, bought, qdec, EQUITY, fx)
+                my_stop = st.number_input(f"🛑 내 손절가 ({unit}) — 매수할 때 정한 값이 있으면 그 값을 넣으세요", min_value=0.0,
+                                          value=float(round(sug, 4 if not is_kr else 0)), format="%.0f" if is_kr else "%.4f",
+                                          key=f"pos_stop_{tk}_{bought}", help=f"기본값: {sug_src}. 손절가는 올리기만 하고 내리지 않습니다.")
+                my_stop = my_stop if isinstance(my_stop, (int, float)) and my_stop > 0 else sug
+                pp = position_plan(df, avg_px, qty, bought, tp1_done, my_stop, qdec, EQUITY, fx)
+            except Exception as e:
+                pp = None
+                st.error(f"분석 실패 ({type(e).__name__}: {e}) — 판단이 안 될 때는 매수할 때 정한 손절가를 지키세요.")
+            if pp:
+                def money(v):
+                    if v is None:
+                        return "-"
+                    return f"₩{v:,.0f}" if is_kr else f"${v:,.2f} (≈₩{v * fx:,.0f})"
+                def pxs(v):
+                    return "-" if v is None else (f"₩{v:,.0f}" if is_kr else f"${v:,.4g}" if v < 1 else f"${v:,.2f}")
+                def qtxt(q):
+                    return f"{int(q):,}주" if qdec == 0 else f"{q:,.4f}개"
+                sty = POS_STYLE[pp['action']]
+                title = sty['title'] + (f" — {pp['add_row']['n']}차" if pp['action'] == "ADD" and pp['add_row'] else "")
+                st.markdown(
+                    f"""<div style="background:{sty['bg']};color:#fff;padding:16px 20px;border-radius:12px;margin:6px 0 10px 0">
+<div style="font-size:28px;font-weight:800;line-height:1.25">{title}</div>
+<div style="font-size:15px;opacity:.95;margin-top:6px">{'<br>'.join(pp['reasons'])}</div></div>""", unsafe_allow_html=True)
+
+                m1, m2, m3, m4 = st.columns(4)
+                m1.metric("현재가", pxs(pp['px']), f"평단 대비 {pp['pnl_pct']:+.1f}%")
+                m2.metric("🛑 손절가", pxs(pp['stop']), f"현재가 대비 {pp['dist'] * 100:+.1f}%", delta_color="off")
+                m3.metric("손절 시 손익", f"₩{pp['loss_krw']:,.0f}", f"총자산의 {pp['loss_pct']:+.2f}%", delta_color="off")
+                m4.metric("평가손익", money(pp['pnl']))
+                st.caption(f"손절가 기준: {pp['stop_kind']} · 총자산은 사이드바 값(₩{EQUITY:,.0f}) 기준")
+                if pp['loss_pct'] < -RISK_PER_TRADE * 1.5:
+                    st.warning(f"손절 시 손실이 총자산의 {abs(pp['loss_pct']):.1f}%로, 1회 허용 손실({RISK_PER_TRADE:g}%)보다 큽니다. "
+                               "다음부터는 수량을 줄이거나, 지금 일부를 줄여 손실 한도를 맞추는 것을 검토하세요.")
+
+                st.markdown("##### 📋 지금 걸어 둘 주문")
+                rows = [{"주문": "🛑 손절 (스탑 감시 주문)", "가격": pxs(pp['stop']), "수량": qtxt(qty), "체결 시 손익": money(pp['loss'])}]
+                if pp['action'] in ("STOP", "EXIT"):
+                    rows = [{"주문": "🔴 다음 봉 시가에 전량 매도", "가격": pxs(pp['px']), "수량": qtxt(qty), "체결 시 손익": money(pp['pnl'])}]
+                elif pp['action'] == "HALF":
+                    q1 = _qty_floor(qty * 0.5, qdec)
+                    rows.insert(0, {"주문": "🟠 지금 절반 매도", "가격": pxs(pp['px']), "수량": qtxt(q1), "체결 시 손익": money((pp['px'] - avg_px) * q1)})
+                elif pp['action'] == "TP1":
+                    q1 = _qty_floor(qty * 0.5, qdec)
+                    rows.insert(0, {"주문": f"🟠 지금 절반 매도 (1차 익절 · {pp['tp_label']} 도달)", "가격": pxs(pp['px']), "수량": qtxt(q1),
+                                    "체결 시 손익": money((pp['px'] - avg_px) * q1)})
+                    rows.append({"주문": "⬆️ 매도 후 남은 물량 손절가", "가격": pxs(max(avg_px, pp['stop'])), "수량": qtxt(qty - q1), "체결 시 손익": "본절 이상"})
+                elif not tp1_done and pp['tp']:
+                    q1 = _qty_floor(qty * 0.5, qdec)
+                    rows.append({"주문": f"🎯 1차 익절 지정가 ({pp['tp_label']})", "가격": pxs(pp['tp']), "수량": qtxt(q1),
+                                 "체결 시 손익": money((pp['tp'] - avg_px) * q1)})
+                if pp['action'] == "ADD" and pp['add_row']:
+                    ar = pp['add_row']
+                    rows.append({"주문": f"🔵 {ar['n']}차 추가 매수", "가격": pxs(ar['price'] / fx),
+                                 "수량": qtxt(ar['qty']), "체결 시 손익": "-"})
+                if (tp1_done or bought == 0) and pp['trail']:
+                    rows.append({"주문": "📈 트레일링 (매일 올리기만)", "가격": pxs(pp['trail']), "수량": "남은 물량 전부", "체결 시 손익": money((pp['trail'] - avg_px) * qty)})
+                st.dataframe(pd.DataFrame(rows), hide_index=True)
+
+                st.markdown("##### 🧭 손절가가 바뀌는 순서")
+                if bought == 0:
+                    st.markdown(f"- 사다리와 무관하게 산 종목은 **내 손절가와 트레일링({pxs(pp['trail'])}) 중 높은 값**을 손절가로 씁니다. "
+                                "트레일링은 매일 올리기만 하고, 구조 붕괴 신호가 나오면 전량, 고점 징후가 2개 이상이면 절반을 정리합니다.")
+                if bought:
+                    st.markdown(f"1. **1차 익절 전**: 매수 때 정한 손절가({pxs(my_stop)})를 그대로 둡니다. 가격이 빠져도 **내리지 않고, 그 아래에서 추가 매수하지 않습니다.**")
+                    st.markdown(f"2. **1차 익절({pxs(pp['tp']) if pp['tp'] else '-'} · 평단 + 손절폭의 {POS_TP1_R:g}배 이상 첫 저항) 후**: 손절가를 **평단가({pxs(avg_px)}) 이상**으로 올려 남은 물량을 무위험으로 만듭니다.")
+                    st.markdown(f"3. **그 뒤**: 트레일링({pxs(pp['trail'])} · 최근 {SELL_TRAIL_N}봉 고점 − {TP3_TRAIL_ATR:g} ATR)이 더 높아지면 그 값으로 계속 올립니다.")
+
+                ict = pp['ict']
+                wi = (ict or {}).get('wict') or {}
+                wm = W_STATE_META.get(wi.get('state', "W_NA"))
+                with st.expander("🔍 판단 근거 (주봉 추세 · ICT 단계 · 매도 신호)", expanded=pp['action'] not in ("HOLD",)):
+                    st.markdown(f"- 주봉 추세: {wm['icon']} {wm['label']}" + (f" · 전환 기준선 {pxs(wi['level'])} ({wi['dist'] * 100:+.1f}%)" if wi.get('level') else ""))
+                    st.markdown(f"- 일봉 ICT 단계: {ICT_STAGE_LABEL.get(ict.get('stage'), ict.get('stage'))}")
+                    st.markdown(f"- 구조 붕괴 신호: " + (" · ".join(pp['r']['hard']) if pp['r']['hard'] else "없음"))
+                    st.markdown(f"- 고점 징후 ({len(pp['r']['soft'])}개, 2개 이상이면 절반 익절): " + (" · ".join(pp['r']['soft']) if pp['r']['soft'] else "없음"))
+
+                fibs = calculate_fibonacci_levels(df)
+                lines = [(avg_px, "평단가", "#7e57c2"), (pp['stop'], "손절가", "#ef5350")]
+                if pp['tp'] and not tp1_done:
+                    lines.append((pp['tp'], "1차 익절(50%)", "#26a69a"))
+                if pp['trail'] and (tp1_done or bought == 0):
+                    lines.append((pp['trail'], "트레일링", "#ffa726"))
+                st.plotly_chart(build_chart(df, fibs, 1.0, None, pp['r']['info'], None, extra_lines=lines,
+                                            zones=(ict or {}).get('zones')), width="stretch")
+                st.caption("※ 규칙 기반 참고 도구이며 수익을 보장하지 않습니다. 투자 판단과 책임은 본인에게 있습니다.")
