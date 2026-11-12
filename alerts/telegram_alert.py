@@ -1,16 +1,14 @@
 #!/usr/bin/env python3
 """
-텔레그램 매수 타점 알림 — 앱(app.py)의 스크리너와 '똑같은 코드'로 143종목을 판정해서 🟢 매수 타점만 보냅니다.
-  · 아침(07:30): 미국장 마감 후 → 미국 신호 + 오늘 아침 주문할 국내 신호 다시 알림
-  · 저녁(16:45): 국내장 마감 후 → 내일 아침 주문할 국내 신호
-  · 앱의 데이터 로더 · 봉 마감 규칙 · ICT 판정 · 실적 5일 가드 · 실전 대상 구분을 그대로 씀 (앱 화면과 같은 결론)
-  · 처음 알리는 신호에는 🆕 표시 (state.json에 이전 알림 기억)
+텔레그램 1차 매수 타점 알림 — 앱(app.py)의 스크리너와 같은 코드로 143종목을 판정해서,
+모든 시장을 통틀어 '1차 매수가 유효한' 종목만 한 줄씩 보냅니다.
+  · 제외: 2·3차, 실적 발표 5일 이내, ETF·레버리지·코인·원자재·상장 1년 미만 (앱과 같은 기준)
+  · 아침(07:30): 미국장 마감 후 · 저녁(16:45): 국내장 마감 후
 
-필요한 환경 변수: TELEGRAM_TOKEN (BotFather에서 받은 봇 토큰) · TELEGRAM_CHAT_ID (내 채팅 ID)
+환경 변수: TELEGRAM_TOKEN (봇 토큰) · TELEGRAM_CHAT_ID (내 채팅 ID)
 실행:
-  python alerts/telegram_alert.py                 # 판정 후 텔레그램 전송
-  python alerts/telegram_alert.py --dry-run       # 보내지 않고 메시지만 화면에 출력 (처음 확인용)
-  python alerts/telegram_alert.py --chat-id       # 봇에게 아무 말이나 보낸 뒤 실행 → 내 채팅 ID 확인
+  python alerts/telegram_alert.py --dry-run     # 보내지 않고 화면에만
+  python alerts/telegram_alert.py --chat-id     # 내 채팅 ID 확인
 """
 import argparse, json, os, sys, time, types
 from datetime import datetime, timedelta, timezone
@@ -23,6 +21,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 MARK = "# ==========================================\n# 사이드바 네비게이션"
 KST = timezone(timedelta(hours=9))
 MAX_LEN = 3800                              # 텔레그램 한 메시지 4096자 제한 → 여유 두고 나눔
+OPEN_CAP = 0.03                             # 주문 상한: 신호 종가 +3% (앱의 OPEN_CAP_PCT와 같게)
 
 
 # ───────────────────────── 앱 엔진 불러오기 (화면 부분 제외 · 데이터는 진짜로 받음) ─────────────────────────
@@ -130,64 +129,28 @@ def fmt_px(t, v):
     return f"${v:,.2f}" if v >= 1 else f"${v:,.4f}"
 
 
-def build_message(ns, res, state, now):
-    is_am = now.hour < 12
-    head = f"📡 매수 타점 알림 · {now:%m/%d}({'월화수목금토일'[now.weekday()]}) {now:%H:%M} {'아침' if is_am else '저녁'}"
+def build_message(ns, res, now):
+    """모든 시장 통틀어 '1차 매수가 유효한' 실전 대상 종목만, 한 종목 한 줄"""
+    head = f"📡 1차 매수 타점 · {now:%m/%d}({'월화수목금토일'[now.weekday()]}) {'아침' if now.hour < 12 else '저녁'}"
     if res is None or res.empty:
-        return [head + "\n\n데이터를 받지 못했습니다. 앱에서 직접 확인하세요."], set()
+        return [head + "\n데이터를 받지 못했습니다. 앱에서 확인하세요."]
     kind = res.get("_kind", pd.Series("", index=res.index)).astype(str)
-    concl = res.get("결론", pd.Series("", index=res.index)).astype(str)
-    biko = res.get("비고", pd.Series("", index=res.index)).astype(str)
-
-    def scope(r):
-        ok, why = ns["trade_scope"](r["티커"], r.get("섹터"))
-        if ok and "신규 상장" in str(r.get("비고", "")):
-            return False, "상장 1년 미만"
-        return ok, why
-
-    buys, refs, keys = [], [], set()
+    items = []
     for _, r in res[kind == "BUY"].iterrows():
-        ok, why = scope(r)
         tr = r.get("_tranche")
-        tr = int(tr) if isinstance(tr, (int, float)) and np.isfinite(tr) else None
-        key = f"{r['티커']}|{tr}"                      # 같은 종목·같은 차수를 10일 안에 이미 알렸으면 🆕 아님
-        keys.add(key)
-        last = state.get(key)
-        new = last is None or (now.date() - datetime.fromisoformat(last).date()).days > 10
-        (buys if ok else refs).append((r, tr, new, why))
-    earn = res[concl.str.contains("실적 후 판단")]
-    conf = res[concl.str.contains("확인 대기")]
-    errs = int(res.get("단계", pd.Series("", index=res.index)).astype(str).str.contains("오류").sum())
-
-    L = [head, ""]
-    if buys:
-        L.append(f"🟢 <b>실전 대상 매수 타점 {len(buys)}개</b>")
-        buys.sort(key=lambda x: (not x[2], str(x[0].get("시장")), x[1] or 9))
-        for r, tr, new, _ in buys:
-            px = r.get("현재가")
-            sd = r.get("손절선까지")
-            stop = px * (1 + sd) if (px is not None and sd is not None and np.isfinite(sd)) else None
-            loss1 = (px - stop) if stop else None
-            wk = str(r.get("주봉", ""))
-            L.append(f"{'🆕 ' if new else ''}<b>{r['종목']}</b> ({r['티커']}) · {tr or '-'}차 · {r.get('섹터', '')}")
-            L.append(f"   현재 {fmt_px(r['티커'], px)} · 손절 {fmt_px(r['티커'], stop)}"
-                     + (f" ({sd * 100:+.1f}%)" if sd is not None and np.isfinite(sd) else "")
-                     + (f" · 1주 손실 {fmt_px(r['티커'], loss1)}" if loss1 else ""))
-            extra = [x for x in (wk if "하락" in wk else "", str(r.get("기준봉", ""))) if x]
-            if extra:
-                L.append("   " + " · ".join(extra))
-    else:
-        L.append("🟢 실전 대상 매수 타점: <b>없음</b>")
-    if len(earn):
-        L += ["", "📅 실적 후 판단 (지금 사지 않음): " + ", ".join(f"{r['종목']}({r.get('실적', '')})" for _, r in earn.head(10).iterrows())]
-    if len(conf):
-        L += ["", "⏳ 다음 종가로 1차 확인: " + ", ".join(str(r["종목"]) for _, r in conf.head(12).iterrows())]
-    if refs:
-        L += ["", "🏷️ 참고용 신호 (매매 안 함): " + ", ".join(f"{r['종목']}" for r, *_ in refs[:15])]
-    L += ["", "※ 주문 전 앱에서 다시 확인 · 동시 3종목·같은 섹터 1종목 · 체결 즉시 손절 주문"
-          + (" · 미국 주식 손절은 달러로" if any(not str(r["티커"]).endswith((".KS", ".KQ")) for r, *_ in buys) else "")]
-    if errs:
-        L.append(f"※ 데이터 오류 {errs}종목 (앱에서 확인)")
+        if not (isinstance(tr, (int, float)) and np.isfinite(tr) and int(tr) == 1):
+            continue                                          # 1차만
+        ok, _why = ns["trade_scope"](r["티커"], r.get("섹터"))
+        if not ok or "신규 상장" in str(r.get("비고", "")):
+            continue                                          # ETF·코인·원자재·상장 1년 미만 제외
+        px, sd = r.get("현재가"), r.get("손절선까지")
+        if px is None or sd is None or not np.isfinite(sd):
+            continue
+        items.append((sd, f"• {r['종목']} {fmt_px(r['티커'], px)} | 손절 {fmt_px(r['티커'], px * (1 + sd))} ({sd * 100:+.1f}%)"))
+    if not items:
+        return [head + "\n오늘은 1차 매수 타점이 없습니다."]
+    items.sort(key=lambda x: -x[0])                            # 손절폭이 좁은 순
+    L = [head] + [x[1] for x in items] + ["", "주문: 다음 날 시가 (상한 종가 +3%) · 체결 즉시 손절"]
     msgs, cur = [], ""
     for line in L:
         if len(cur) + len(line) + 1 > MAX_LEN:
@@ -196,7 +159,7 @@ def build_message(ns, res, state, now):
         cur += line + "\n"
     if cur.strip():
         msgs.append(cur)
-    return msgs, keys
+    return msgs
 
 
 # ───────────────────────── 텔레그램 ─────────────────────────
@@ -222,7 +185,6 @@ def tg_chat_id(token):
 def main():
     ap = argparse.ArgumentParser(description="텔레그램 매수 타점 알림")
     ap.add_argument("--app", default=os.path.join(HERE, "..", "app.py"))
-    ap.add_argument("--state", default=os.path.join(HERE, "state.json"))
     ap.add_argument("--dry-run", action="store_true", help="보내지 않고 화면에만 출력")
     ap.add_argument("--chat-id", action="store_true", help="내 채팅 ID 확인")
     ap.add_argument("--data-dir", default=None, help="테스트용: 인터넷 대신 CSV 폴더 사용")
@@ -248,25 +210,13 @@ def main():
     if a.data_dir:
         use_csv_data(ns, a.data_dir, a.asof)
     res = scan_all(ns, set(a.only) if a.only else None)
-    try:
-        state = dict(json.load(open(a.state, encoding="utf-8")).get("alerted", {}))     # {티커|차수: 마지막 알림 날짜}
-    except Exception:
-        state = {}
-    msgs, keys = build_message(ns, res, state, now)
+    msgs = build_message(ns, res, now)
     for m in msgs:
         print("\n" + m)
         if not a.dry_run:
             tg_send(token, chat, m)
             time.sleep(1)
     if not a.dry_run:
-        try:
-            for k in keys:
-                state[k] = now.date().isoformat()
-            cut = now.date() - timedelta(days=60)
-            state = {k: v for k, v in state.items() if datetime.fromisoformat(v).date() >= cut}
-            json.dump(dict(alerted=state, updated=now.isoformat()), open(a.state, "w", encoding="utf-8"), ensure_ascii=False, indent=1)
-        except Exception:
-            pass
         print(f"\n전송 완료 ({len(msgs)}개 메시지)")
 
 
