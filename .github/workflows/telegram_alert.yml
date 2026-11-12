@@ -1,0 +1,51 @@
+# 텔레그램 매수 타점 알림 (평일 아침·저녁 자동 실행)
+#  - 아침 07:30 KST (미국장 마감 후)  = 22:30 UTC (일~금)
+#  - 저녁 16:45 KST (국내장 마감 후)  = 07:45 UTC (월~금)
+#  GitHub 예약 실행은 보통 5~30분 늦게 시작할 수 있습니다.
+#  필요: 저장소 Settings → Secrets and variables → Actions → TELEGRAM_TOKEN, TELEGRAM_CHAT_ID
+name: telegram-alert
+
+on:
+  schedule:
+    - cron: "30 22 * * 0-5"
+    - cron: "45 7 * * 1-5"
+  workflow_dispatch: {}          # Actions 탭에서 'Run workflow'로 바로 테스트
+
+concurrency:
+  group: telegram-alert
+  cancel-in-progress: false
+
+jobs:
+  alert:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install
+        run: pip install -r requirements.txt
+
+      - name: Restore alert state
+        uses: actions/cache/restore@v4
+        with:
+          path: alerts/state.json
+          key: alert-state-${{ github.run_id }}
+          restore-keys: alert-state-
+
+      - name: Run alert
+        env:
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: python alerts/telegram_alert.py --app app.py
+
+      - name: Save alert state
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: alerts/state.json
+          key: alert-state-${{ github.run_id }}
