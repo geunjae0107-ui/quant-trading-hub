@@ -50,8 +50,11 @@ HIST_BARS = 60             # '과거 국면 표시'에서 다시 판정할 최�
 MIN_RISK_ATR = 0.8         # 손절폭 최소값 (너무 타이트한 손절 방지)
 RES_MIN_GAP_ATR = 1.0      # 다음 저항으로 인정할 최소 거리 (ATR 배수)
 RR_MIN = 1.5               # 이 손익비 미만이면 진입 부적합
-RISK_PER_TRADE = 1.0       # 1회 매매 허용 손실 (총자산 대비 %)
-MAX_POSITION_PCT = 30.0    # 단일 종목 최대 비중 (총자산 대비 %)
+RISK_PER_TRADE = 2.0       # 1회 매매 허용 손실 (총자산 대비 %) — 사이드바에서 바꿈
+MAX_POSITION_PCT = 30.0    # 단일 종목 최대 비중 (총자산 대비 %) — 손실 % 기준 모드에서만 적용
+SIZE_MODE = "shares"       # "shares" = 차수마다 정한 주식 수(계좌 크기와 무관) · "risk" = 손실 % 기준 자동 계산 — 사이드바에서 바꿈
+SHARES_PER_TRANCHE = (1, 1, 1)   # 주 단위 모드: 1차(발목) · 2차 · 3차(무릎)에 살 주식 수
+OPEN_CAP_PCT = 3.0         # 주문 방식(갭 분석 2026-11-12): 신호 다음 날 시가 매수, 상한 = 신호 종가 +3% (지정가 대기보다 신호당 +0.067R)
 
 # 한 단계 상위 프레임과, 그 프레임의 봉 하나가 '완성'되는 데 걸리는 시간
 UPPER_TF = {"15분": "1시간", "1시간": "4시간", "4시간": "1일", "1일": "주봉", "주봉": "월봉", "월봉": None}
@@ -309,7 +312,7 @@ def add_indicators(df):
     df['SETUP_DIV'] = df['BULL_DIV_RSI'] | df['BULL_DIV_MACD']
     df['SETUP_A'] = df['SETUP_OK'] & df['SSL_SWEEP'] & df['SETUP_DIV']
     # 차트 매수 마커용: 돌파봉이 마감 확정된 다음 봉에 True (실제로 행동 가능해진 시점)
-    df['BULL_CHOCH_CONFIRMED'] = df['BULL_CHOCH'].shift(1).fillna(False).astype(bool)
+    df['BULL_CHOCH_CONFIRMED'] = df['BULL_CHOCH'].shift(1, fill_value=False).astype(bool)
     return df
 
 # ==========================================
@@ -1379,7 +1382,36 @@ def _won(v, small=False):
     return "-" if v is None else (f"₩{v:,.2f}" if small else f"₩{v:,.0f}")
 
 
+def order_hint(lad, rate, small=False):
+    """'지금' 차수가 있을 때 주문 방법 한 줄: 다음 날 시가 매수 · 상한 = 신호 종가 +3% (갭 분석 결과)"""
+    if not lad or lad.get('err') or not lad.get('now') or not lad.get('cap_px'):
+        return None
+    us = bool(rate) and abs(float(rate) - 1.0) > 1e-9
+    how = ("미국 정규장 시작용 지정가 (데이마켓·프리마켓 말고 정규장)" if us
+           else "장 시작 전 동시호가(08:30~09:00)에 지정가")
+    return (f"🛒 주문: **다음 날 시가에 매수** — {how} **{_wu(lad['cap_px'], rate, small)}** "
+            f"(신호 종가 {_wu(lad['ref_px'], rate, small)} +{OPEN_CAP_PCT:g}%). 시가가 이 아래면 시가에 체결되고, "
+            f"+{OPEN_CAP_PCT:g}% 넘게 갭상승하면 건너뜁니다. 종가 지정가로 기다리면 좋은 신호를 놓칩니다(검증).")
+
+
+def _wu(v, rate, small=False):
+    """원화 + 달러 병기 (미국 주식·코인처럼 원화로 환산해 보여 줄 때). 주문 화면에는 달러 값을 넣으세요"""
+    s_ = _won(v, small)
+    try:
+        if v is not None and rate and abs(float(rate) - 1.0) > 1e-9:
+            usd = float(v) / float(rate)
+            s_ += f" (${usd:,.2f})" if usd >= 1 else f" (${usd:,.4f})"
+    except Exception:
+        pass
+    return s_
+
+
 def _qty_txt(q, qty_dec):
+    try:
+        if float(q).is_integer():                   # 주 단위로 산 경우 (소수점 모드여도 1.0000주 대신 1주)
+            return f"{int(q):,}주"
+    except Exception:
+        pass
     if qty_dec == 0:
         return f"{int(q):,}주"
     if qty_dec is None:
@@ -1466,7 +1498,7 @@ def render_entry_plan(v, plan2, info, curr, rate, qty_dec, equity):
             st.warning("한 차수의 수량이 0입니다 (1주 가격이 배정 금액보다 큼). 이 종목은 1회 진입으로 나누거나 매수하지 않는 편이 맞습니다.")
         if v['kind'] != "BUY":
             st.info("지금은 🟢 매수 실행 상태가 아니므로, 이 표는 **조건이 충족됐을 때의 예약 계획**입니다. 지금 주문하지 마세요.")
-        st.caption(f"※ 손실에는 편도 {SPLIT_COST * 100:.2f}%의 수수료·슬리피지를 포함했습니다. 총자산은 사이드바에서 바꿀 수 있습니다.")
+        st.caption(f"※ 손실에는 편도 {SPLIT_COST * 100:.2f}%의 수수료·슬리피지를 포함했습니다. 수량 방식·총자산은 사이드바에서 바꿀 수 있습니다.")
 
 
 
@@ -1499,7 +1531,7 @@ GRADE_B_MULT = 0.5            # B급(조건부) 신호의 리스크 배수 (GRAD
 GRADE_ACTIVE = False          # 등급으로 매수 여부·비중을 바꿀지. 검증(2019~2026, 43종목)에서 A급이 B급보다 나빠 지금은 참고 표시만
 ICT_MIN_STOP_PCT = 3.0        # 손절폭 최소값(%): 검증에서 손절폭 3% 이하 신호는 손절 비율 73~87%로 잡음에 털림
 ICT_MIN_STOP_ATR = 1.0        # 손절폭 최소값(ATR 배수) — 둘 중 넓은 쪽 적용
-APP_VERSION = "v1.0 (2026-11-08 규칙 확정 · 매수 규칙 고정)"
+APP_VERSION = "v1.0.2 (2026-11-12 · 매수 규칙은 v1.0 그대로 · 주 단위 수량·달러 병기·시가 주문 안내)"
 ICT_BOX_SWEEP = False         # 박스권 스윕(와이코프 스프링) 인정 — v1.0 검증(2019~2026, 43종목)에서 신호 9건·효과 없음(OOS 소폭 악화)으로 끔
 BOX_MIN_N, BOX_MAX_N = 4, 15  # 박스로 볼 봉 수 범위
 BOX_MAX_RANGE_ATR = 1.5       # 박스 높이(고가−저가)가 이 배수(ATR) 이하일 때만 박스로 인정 (BTC 2026-10-30~11-03 박스 ≈ 0.6 ATR)
@@ -2182,10 +2214,20 @@ def ict_ladder(info, ict, equity, rate=1.0, qty_dec=0, grade=None):
             cum_loss += amt * lf
         rows.append(dict(n=k, weight=wt, price=p, qty=q, amount=amt, status=stt, cond=cnd, live=live,
                          cum_loss=cum_loss, cum_loss_pct=cum_loss / equity * 100))
+    shares_mode = SIZE_MODE == "shares"
+    if shares_mode:                                 # 주 단위: 가격·손절은 그대로, 수량만 '차수마다 정한 주식 수' (계좌 크기와 무관)
+        capped, cum_loss = False, 0.0
+        for r, lf in zip(rows, loss):
+            if r['live']:
+                q = float(SHARES_PER_TRANCHE[r['n'] - 1])
+                r.update(qty=q, amount=q * r['price'])
+                cum_loss += r['amount'] * lf
+            r['cum_loss'] = cum_loss
+            r['cum_loss_pct'] = cum_loss / equity * 100 if equity else float('nan')
     # 소액 계좌 · 고가주: 나눠 사면 모든 차수가 0주 → 손실 한도 전체를 한 차수에 몰아 1회 진입 (가능할 때만)
     single = None
     live_rows = [r for r in rows if r['live']]
-    if qty_dec == 0 and live_rows and all(r['qty'] == 0 for r in live_rows):
+    if not shares_mode and qty_dec == 0 and live_rows and all(r['qty'] == 0 for r in live_rows):
         tgt = next((r for r in live_rows if r['status'] == "지금"), None) or next((r for r in live_rows if r['status'].startswith("대기")), None)
         if tgt:
             lf = loss[tgt['n'] - 1]
@@ -2199,10 +2241,20 @@ def ict_ladder(info, ict, equity, rate=1.0, qty_dec=0, grade=None):
                     elif r['live']:
                         r.update(qty=0, amount=0.0, status="생략: 소액 계좌 단일 진입", live=False)
                 single = tgt['n']
+    # 1주만 사도 손실 한도를 넘는 경우 (소수점 매수 불가 · 고가주 · 넓은 손절): 한도를 넘겨 1주 사지 말고 건너뛰도록 안내
+    over1 = None
+    if not shares_mode and single is None and live_rows and all(r['qty'] == 0 for r in live_rows):
+        tg2 = (next((r for r in live_rows if r['status'] == "지금"), None)
+               or next((r for r in live_rows if r['status'].startswith("대기")), None) or live_rows[0])
+        one = tg2['price'] * loss[tg2['n'] - 1]
+        over1 = dict(n=tg2['n'], loss=one, pct=(one / equity * 100) if equity else float('nan'), limit=R)
     now = next((r for r in rows if r['status'] == "지금"), None)
     total = sum(r['amount'] for r in rows if r['live'])                    # 실제 체결 수량 기준 (지난 차수 제외)
+    plan_loss = sum(r['amount'] * lf for r, lf in zip(rows, loss) if r['live'])
     return dict(err=None, rows=rows, sl=SL, sl_pct=(SL / (px * rate) - 1) * 100, stop_src=stop_src, total=total,
-                risk_eff=risk_eff, notes=notes, capped=capped, now=now, filters_ok=n_ok, single=single)
+                risk_eff=risk_eff, notes=notes, capped=capped, now=now, filters_ok=n_ok, single=single, over1=over1,
+                shares=shares_mode, plan_loss=plan_loss, plan_loss_pct=(plan_loss / equity * 100) if equity else float('nan'),
+                ref_px=px * rate, cap_px=px * rate * (1 + OPEN_CAP_PCT / 100))
 
 
 
@@ -2248,8 +2300,8 @@ def render_ict_banner(v, lad, info, ict, curr, rate, qty_dec, equity, basis=None
     ok = lad is not None and not lad.get('err')
     if v['kind'] == "BUY" and ok and lad.get('now'):
         r = lad['now']
-        m1.metric(f"① 지금 {r['n']}차 매수", _won(r['price'], small), _qty_txt(r['qty'], qty_dec), delta_color="off")
-        m2.metric("② 공통 손절가 (무효화)", _won(lad['sl'], small), f"{lad['sl_pct']:+.1f}%", delta_color="off")
+        m1.metric(f"① 지금 {r['n']}차 매수", _wu(r['price'], rate, small), _qty_txt(r['qty'], qty_dec), delta_color="off")
+        m2.metric("② 공통 손절가 (무효화)", _wu(lad['sl'], rate, small), f"{lad['sl_pct']:+.1f}%", delta_color="off")
         m3.metric("③ 이번 매수 금액", _won(r['amount']), f"총자산의 {r['amount'] / equity * 100:.1f}%", delta_color="off")
         left = [x for x in lad['rows'] if x['n'] > r['n']]
         m4.metric("④ 남은 차수", f"{len(left)}개" if left else "없음", " · ".join(f"{x['n']}차 {_won(x['price'], small)}" for x in left) or None,
@@ -2257,21 +2309,21 @@ def render_ict_banner(v, lad, info, ict, curr, rate, qty_dec, equity, basis=None
     elif v.get('earn_wait') and ok and lad.get('now'):
         r = lad['now']
         m1.metric("① 실적 발표까지", f"D-{v.get('earn_d')}", "발표 전에는 사지 않음", delta_color="off")
-        m2.metric("② 발표 후 확인할 가격", _won(r['price'], small), f"{r['n']}차 · 종가로 신호 유지 확인", delta_color="off")
-        m3.metric("③ 공통 손절가", _won(lad['sl'], small), f"{lad['sl_pct']:+.1f}%", delta_color="off")
+        m2.metric("② 발표 후 확인할 가격", _wu(r['price'], rate, small), f"{r['n']}차 · 종가로 신호 유지 확인", delta_color="off")
+        m3.metric("③ 공통 손절가", _wu(lad['sl'], rate, small), f"{lad['sl_pct']:+.1f}%", delta_color="off")
         m4.metric("④ 지금 권장 비중", "0%")
     elif v.get('confirm') and ok:
         r1 = lad['rows'][0]
-        m1.metric("① 내일 확인할 것", f"종가 {_won(v['confirm'] * rate, small)} 위", "유지되면 1차 확정", delta_color="off")
-        m2.metric("② 그때 1차 매수", _won(r1['price'], small), _qty_txt(r1['qty'], qty_dec), delta_color="off")
-        m3.metric("③ 공통 손절가", _won(lad['sl'], small), f"{lad['sl_pct']:+.1f}%", delta_color="off")
+        m1.metric("① 내일 확인할 것", f"종가 {_wu(v['confirm'] * rate, rate, small)} 위", "유지되면 1차 확정", delta_color="off")
+        m2.metric("② 그때 1차 매수", _wu(r1['price'], rate, small), _qty_txt(r1['qty'], qty_dec), delta_color="off")
+        m3.metric("③ 공통 손절가", _wu(lad['sl'], rate, small), f"{lad['sl_pct']:+.1f}%", delta_color="off")
         m4.metric("④ 지금 권장 비중", "0%")
     elif v['kind'] == "WAIT" and ok:
         nxt = next((x for x in lad['rows'] if x['status'].startswith("대기")), None)
         names = {1: "스윕 후 회복", 2: "CHoCH 돌파", 3: "리테스트"}
         m1.metric("① 다음 매수", f"{nxt['n']}차 · {names[nxt['n']]}" if nxt else "-", None)
-        m2.metric("② 기준 가격", _won(nxt['price'], small) if nxt else "-", (nxt.get('cond') if nxt else None), delta_color="off")
-        m3.metric("③ 예상 손절가", _won(lad['sl'], small), f"{lad['sl_pct']:+.1f}%", delta_color="off")
+        m2.metric("② 기준 가격", _wu(nxt['price'], rate, small) if nxt else "-", (nxt.get('cond') if nxt else None), delta_color="off")
+        m3.metric("③ 예상 손절가", _wu(lad['sl'], rate, small), f"{lad['sl_pct']:+.1f}%", delta_color="off")
         m4.metric("④ 그때 수량 · 지금 비중", _qty_txt(nxt['qty'], qty_dec) if nxt else "-", "지금은 0%", delta_color="off")
     else:
         rg = (ict or {}).get('range') or {}
@@ -2347,7 +2399,9 @@ def render_ict_box(ict, info, rate):
 
 
 def render_ladder(v, lad, curr, rate, qty_dec, equity):
-    with st.expander("🪜 3단 분할 매수 사다리 (손실 한도 30% 스윕 후 회복 · 30% CHoCH · 40% 리테스트 · 공통 손절)", expanded=v['kind'] == "BUY"):
+    _ttl = ("🪜 3단 분할 매수 사다리 (주 단위 · 발목→무릎 · 공통 손절)" if SIZE_MODE == "shares"
+            else "🪜 3단 분할 매수 사다리 (손실 한도 30% 스윕 후 회복 · 30% CHoCH · 40% 리테스트 · 공통 손절)")
+    with st.expander(_ttl, expanded=v['kind'] == "BUY"):
         if lad is None:
             st.caption("사다리를 만들 데이터가 부족합니다.")
             return
@@ -2356,17 +2410,40 @@ def render_ladder(v, lad, curr, rate, qty_dec, equity):
             return
         small = curr * rate < 1000
         names = {1: "1차 · 스윕 후 회복", 2: "2차 · CHoCH 확정", 3: "3차 · 돌파선 리테스트"}
-        rows = [{"차수": f"{names[r['n']]} (손실 한도 {int(r['weight'] * 100)}%)", "상태": r['status'], "가격": _won(r['price'], small),
+        rows = [{"차수": f"{names[r['n']]}" + (f" ({SHARES_PER_TRANCHE[r['n'] - 1]}주)" if lad.get('shares') else f" (손실 한도 {int(r['weight'] * 100)}%)"),
+                 "상태": r['status'], "가격": _won(r['price'], small),
                  "수량": _qty_txt(r['qty'], qty_dec), "금액": _won(r['amount']),
                  "여기까지 산 뒤 손절 시 손실": (f"{_won(r['cum_loss'])} ({r['cum_loss_pct']:.2f}%)" if r['live'] else "-")} for r in lad['rows']]
         rows.append({"차수": "🛑 공통 손절 (무효화)", "상태": "1차 체결 즉시 스탑 주문 · 모든 차수 공통", "가격": _won(lad['sl'], small),
                      "수량": "전량", "금액": "-", "여기까지 산 뒤 손절 시 손실": "-"})
+        if rate and abs(float(rate) - 1.0) > 1e-9:      # 미국 주식 등: 증권사 주문 화면에 넣을 달러 가격
+            usd = [r['price'] / rate for r in lad['rows']] + [lad['sl'] / rate]
+            for row_, u_ in zip(rows, usd):
+                row_["달러 (주문용)"] = f"${u_:,.2f}" if u_ >= 1 else f"${u_:,.4f}"
         st.dataframe(pd.DataFrame(rows), hide_index=True)
-        st.markdown(f"- 계획 총액(남은 차수 모두 체결 시, 실제 수량 기준): **{_won(lad['total'])}** (총자산의 {lad['total'] / equity * 100:.1f}%) · "
-                    f"적용 리스크 {lad['risk_eff']:.2f}%" + (f" ({', '.join(lad['notes'])})" if lad['notes'] else "")
-                    + f" · 손절 기준: {lad['stop_src']}")
-        st.markdown("- **배분 방식**: 손실 한도(총자산 × 리스크)를 30/30/40으로 나눠, 각 차수가 손절 시 자기 몫만 잃도록 수량을 정합니다. "
-                    "손절가에 가까운 1차(무릎)일수록 같은 손실로 더 많이 살 수 있어 금액이 커집니다.")
+        oh_ = order_hint(lad, rate, small)
+        if oh_ and v['kind'] == "BUY":
+            st.info(oh_)
+        if rate and abs(float(rate) - 1.0) > 1e-9:
+            st.caption("💵 손절 주문은 **달러 가격**으로 거세요. 원화 감시가는 환율이 움직이면 실제 손절 지점이 달라집니다.")
+        if lad.get('shares'):
+            pl, plp = lad['plan_loss'], lad['plan_loss_pct']
+            st.markdown(f"- 계획 총액(남은 차수 모두 체결 시): **{_won(lad['total'])}** · 그 뒤 손절되면 **{_won(pl)} 손실**"
+                        + (f" (총자산의 {plp:.1f}%)" if np.isfinite(plp) else "") + f" · 손절 기준: {lad['stop_src']}")
+            st.markdown("- **배분 방식(주 단위)**: 가격·손절은 규칙대로, 수량만 차수마다 정한 주식 수입니다 (사이드바에서 변경). "
+                        "계좌 크기와 상관없이 같은 수량을 사므로, **손절 시 손실은 종목 가격과 손절폭에 따라 달라집니다.**")
+            if lad['notes']:
+                st.caption("참고: 원래 규칙이면 크기를 줄이는 구간입니다 — " + ", ".join(lad['notes']) + ". 주 단위에서는 수량을 그대로 두니 더 조심하세요.")
+            if np.isfinite(plp) and plp > 20:
+                st.error(f"⚠️ 이 계획대로 다 사고 손절되면 총자산의 {plp:.0f}%를 잃습니다. 차수를 줄이거나(예: 1차만) 이번엔 넘어가는 것도 방법입니다.")
+            elif np.isfinite(plp) and plp > 10:
+                st.warning(f"이 계획대로 다 사고 손절되면 총자산의 {plp:.0f}%를 잃습니다 (큰 편). 손절 주문을 꼭 걸어 두세요.")
+        else:
+            st.markdown(f"- 계획 총액(남은 차수 모두 체결 시, 실제 수량 기준): **{_won(lad['total'])}** (총자산의 {lad['total'] / equity * 100:.1f}%) · "
+                        f"적용 리스크 {lad['risk_eff']:.2f}%" + (f" ({', '.join(lad['notes'])})" if lad['notes'] else "")
+                        + f" · 손절 기준: {lad['stop_src']}")
+            st.markdown("- **배분 방식**: 손실 한도(총자산 × 리스크)를 30/30/40으로 나눠, 각 차수가 손절 시 자기 몫만 잃도록 수량을 정합니다. "
+                        "손절가에 가까운 1차(무릎)일수록 같은 손실로 더 많이 살 수 있어 금액이 커집니다.")
         st.markdown("- **규칙**: ① '지남' 차수는 건너뜁니다 (남은 차수로 몰아 사지 않음) ② 손절가 아래에서는 절대 추가 매수 금지 "
                     "③ 손절가에 닿으면 몇 차까지 샀든 전량 정리 ④ 손절 후 다시 신호가 나오면 새 신호로 봅니다 (복구하려고 수량을 키우지 않기)")
         if lad['capped']:
@@ -2374,11 +2451,16 @@ def render_ladder(v, lad, curr, rate, qty_dec, equity):
         if lad.get('single'):
             st.info(f"💡 소액 계좌 단일 진입: 나눠 사면 모든 차수가 0주라, 손실 한도 전체를 {lad['single']}차 한 번에 씁니다 (다른 차수는 생략). "
                     "손절가는 같고, 손절 시 손실은 1회 허용 손실 이내입니다.")
+        elif lad.get('over1'):
+            o_ = lad['over1']
+            st.warning(f"✋ 1주만 사도 손절 시 {_won(o_['loss'])} (총자산의 {o_['pct']:.1f}%)를 잃습니다 — 1회 한도 {_won(o_['limit'])} "
+                       f"({lad['risk_eff']:.2f}%)를 넘으므로 **이 종목은 건너뜁니다.** 미국 주식이면 사이드바의 '소수점 매수'를 켜면 규칙대로 살 수 있습니다. "
+                       "한도를 넘겨 1주씩 사면 손절 몇 번에 계좌가 크게 줄어듭니다.")
         elif any(r['qty'] == 0 for r in lad['rows'] if r['live']):
-            st.warning("수량이 0인 차수가 있습니다 (1주 가격이 배정 금액보다 큼). 사이드바의 '1회 허용 손실 %'를 올리거나, 이 종목은 넘어가는 편이 맞습니다.")
+            st.info("일부 차수는 수량이 0입니다 (배정 금액이 1주 가격보다 작음). 0인 차수는 건너뛰고 나머지 차수만 삽니다.")
         if v['kind'] != "BUY":
             st.info("지금은 🟢 매수 실행 상태가 아니므로 이 표는 **조건이 충족됐을 때의 예약 계획**입니다. 지금 주문하지 마세요.")
-        st.caption(f"※ 손실에는 편도 {SPLIT_COST * 100:.2f}%의 수수료·슬리피지를 포함했습니다. 총자산은 사이드바에서 바꿀 수 있습니다.")
+        st.caption(f"※ 손실에는 편도 {SPLIT_COST * 100:.2f}%의 수수료·슬리피지를 포함했습니다. 수량 방식·총자산은 사이드바에서 바꿀 수 있습니다.")
 
 
 
@@ -2496,6 +2578,9 @@ def render_dashboard(df, c1, c2, show_hist, rate_text=1.0, rate_chart=1.0, is_co
     with c1:
         if use_ict:
             render_ict_banner(v, lad, info, ict, curr, rate_text, qty_dec, EQUITY, basis=bs, premium=premium)
+            ok_, why_ = trade_scope(df.attrs.get('ticker'), n_bars=len(df) if str(df.attrs.get('tf')) == "1일" else None)
+            if not ok_ and not long_mode:
+                (st.info if v['kind'] == "BUY" else st.caption)(f"ℹ️ 실전 매매 대상 아님 — {why_}. 실제 돈은 국내·미국 개별주 신호에만 씁니다.")
             render_ladder(v, lad, curr, rate_text, qty_dec, EQUITY)
             if long_mode:
                 render_long_term(ict, v, rate_text, qty_dec, premium)
@@ -3243,6 +3328,42 @@ SCREEN_UNIVERSE = {
                          ("DOGE/USDT", "도지코인"), ("ADA/USDT", "에이다"), ("TRX/USDT", "트론"), ("LINK/USDT", "체인링크"), ("AVAX/USDT", "아발란체")],
     },
 }
+# 실전 대상: v1.0 견고성 검증(2026-11-08, 처음 보는 100종목 포함)에서 엣지가 확인된 국내·미국 개별주만.
+# ETF(두 번의 검증 모두 엣지 없음) · 레버리지 ETF · 코인(약함) · 원자재(표본 적음) 신호는 참고용으로만 표시
+REF_ETF = {"SPY", "QQQ", "DIA", "IWM", "VTI", "VOO", "IVV", "SOXX", "SMH", "XLK", "XLF", "XLV", "XLE", "XLI", "XLY", "XLP",
+           "SCHD", "VYM", "VTV", "VUG", "TLT", "IEF", "SHY", "GLD", "SLV", "ITA", "ARKK", "JEPI", "JEPQ", "KWEB", "EEM", "EFA"}
+LEV_ETF = {"SOXL", "TQQQ", "UPRO", "TECL", "TNA", "SPXL", "SQQQ", "SOXS", "LABU", "FNGU", "BULZ", "NVDL", "TSLL", "UDOW"}
+
+
+VALID_MIN_BARS = 250   # 백테스트 검증 범위: 일봉 약 1년(250~260개) 이상 쌓인 종목만 시험함
+
+
+def trade_scope(ticker, sector=None, n_bars=None):
+    """(실전 대상 여부, 이유). 매수 판정은 바꾸지 않고 '실제 돈으로 살 대상인지'만 알려줌. n_bars = 일봉 개수(알 때만)"""
+    t = str(ticker or "").upper().strip()
+    if n_bars is not None and n_bars < VALID_MIN_BARS:
+        return False, f"상장 1년 미만(일봉 {n_bars}개) — 백테스트 검증 범위(일봉 약 1년 이상) 밖이라 참고용"
+    if not t:
+        return True, ""
+    if "/" in t or t.endswith(("-USD", "USDT", "-KRW")) or t.startswith("KRW-"):
+        return False, "코인 신호는 참고용 (검증에서 엣지가 약함 · 비트코인 장기 적립과는 별개)"
+    if "=F" in t:
+        return False, "원자재 선물 신호는 참고용 (검증 표본이 적음)"
+    if sector is None:
+        for groups in SCREEN_UNIVERSE.values():
+            for sec, items in groups.items():
+                if any(str(x[0]).upper() == t for x in items):
+                    sector = sec
+                    break
+            if sector:
+                break
+    if t in LEV_ETF or sector == "ETF·레버리지(3x)":
+        return False, "레버리지 ETF 신호는 참고용 (검증에서 엣지 없음 · 변동성 손실)"
+    if t in REF_ETF or (sector and str(sector).startswith("ETF")) or str(globals().get("market_choice", "")).startswith("📊"):
+        return False, "ETF 신호는 참고용 (두 번의 검증 모두 엣지 없음)"
+    return True, ""
+
+
 def tab_groups(market, etf=None):
     """트레이딩 룸 탭용 종목 목록: SCREEN_UNIVERSE를 그대로 읽어 {섹터: ["티커 (이름)", ...]} 형태로 변환.
     etf=True면 ETF 그룹만, False면 ETF 그룹 제외, None이면 전부. (종목은 SCREEN_UNIVERSE 한곳에서만 고치면 됨)"""
@@ -3771,7 +3892,7 @@ def easy_view(df, rate, qty_dec, equity, ticker=None):
     except Exception:
         vol_big, vol_txt = False, ""
     earn_d, earn_dt = earnings_days(ticker) if (ticker and "/" not in str(ticker)) else (None, None)
-    return dict(light=light, why=why, todo=todo, step=step, stage=stg, v=v, lad=lad, lad_ok=lad_ok, nxt=nxt, ict=ict,
+    return dict(scope=trade_scope(ticker, n_bars=len(df)), light=light, why=why, todo=todo, step=step, stage=stg, v=v, lad=lad, lad_ok=lad_ok, nxt=nxt, ict=ict,
                 vol_big=vol_big, vol_txt=vol_txt, earn_d=earn_d, earn_dt=earn_dt,
                 info=info, bs=bs, curr=curr, small=small, big=(big_icon, big_txt), df=df, zones=zones)
 
@@ -3800,6 +3921,9 @@ def render_easy(ev, name, rate, qty_dec, long_mode, premium=None):
 <div style="font-size:32px;font-weight:800;line-height:1.3;margin-top:4px">{L['icon']} {L['title']}</div>
 <div style="font-size:16px;margin-top:8px;line-height:1.55">{ev['why'].replace('**', '')}</div></div>""", unsafe_allow_html=True)
     st.markdown(f"#### 👉 할 일: {ev['todo']}")
+    sc_ok, sc_why = ev.get('scope') or (True, "")
+    if not sc_ok and not long_mode:
+        st.info(f"ℹ️ 이 종목은 참고·연습용이에요 — {sc_why}. 실제 돈으로는 국내·미국 개별 주식만 사요.")
     try:
         d_ = ev['df']
         chg = float(d_['close'].iloc[-1] / d_['close'].iloc[-2] - 1) * 100 if len(d_) > 1 else 0.0
@@ -3833,15 +3957,23 @@ def render_easy(ev, name, rate, qty_dec, long_mode, premium=None):
         c1, c2, c3 = st.columns(3)
         if ev['light'] == "GO" and ev['lad_ok'] and lad.get('now'):
             r = lad['now']
-            c1.metric("💰 살 가격", _won(r['price'], small), f"{r['n']}차 매수", delta_color="off")
-            c2.metric("🛑 손절 가격", _won(lad['sl'], small), f"이 아래로 마감하면 팔기 ({lad['sl_pct']:+.1f}%)", delta_color="off")
+            cap_ = lad.get('cap_px') or r['price']
+            c1.metric("💰 내일 시가에 사기 · 최고", _wu(cap_, rate, small), f"{r['n']}차 · 오늘 종가 +{OPEN_CAP_PCT:g}%까지", delta_color="off")
+            c2.metric("🛑 손절 가격", _wu(lad['sl'], rate, small), f"이 아래로 마감하면 팔기 ({lad['sl_pct']:+.1f}%)", delta_color="off")
             c3.metric("📦 이번에 살 양", _qty_txt(r['qty'], qty_dec), f"약 {_won(r['amount'])}", delta_color="off")
-            lines = [(r['price'], "살 가격", "#42a5f5"), (lad['sl'], "손절", "#ef5350")]
+            us_ = bool(rate) and abs(float(rate) - 1.0) > 1e-9
+            st.caption(("미국 정규장 시작 때" if us_ else "장 시작 전 동시호가(08:30~09:00)에") + f" '최고' 가격으로 지정가를 걸어요. "
+                       "시가가 그보다 낮으면 시가에 사지고, 더 높게 시작하면 이번엔 건너뛰어요. "
+                       "오늘 종가에 걸어 두고 기다리면 좋은 신호를 놓치기 쉬워요(검증 결과).")
+            lines = [(r['price'], "신호 가격", "#42a5f5"), (lad['sl'], "손절", "#ef5350")]
             if r['qty'] == 0:
-                st.warning("계좌 크기에 비해 1주 가격이 커서 규칙상 살 수 있는 양이 0이에요. 사이드바의 '1회 허용 손실 %'를 조금 올리거나 이번엔 넘어가세요.")
+                o_ = lad.get('over1')
+                st.warning((f"1주만 사도 손절되면 {_won(o_['loss'])} (총자산의 {o_['pct']:.1f}%)를 잃어서 정한 한도를 넘어요. " if o_ else
+                            "이번 차수는 살 양이 0이에요. ")
+                           + "**이번엔 넘어가세요.** 미국 주식이면 사이드바의 '소수점 매수'를 켜면 규칙대로 살 수 있어요. 한도를 넘겨 1주씩 사면 안 돼요.")
         elif ev['lad_ok'] and nxt and ev['light'] in ("WAIT", "NONE"):
             c1.metric("⏰ 기다릴 가격", _won(nxt['price'], small), nxt.get('cond'), delta_color="off")
-            c2.metric("🛑 그때 손절 가격", _won(lad['sl'], small), f"{lad['sl_pct']:+.1f}%", delta_color="off")
+            c2.metric("🛑 그때 손절 가격", _wu(lad['sl'], rate, small), f"{lad['sl_pct']:+.1f}%", delta_color="off")
             c3.metric("📦 그때 살 양", _qty_txt(nxt['qty'], qty_dec), "지금은 0", delta_color="off")
             lines = [(nxt['price'], "기다릴 가격", "#fbbf24"), (lad['sl'], "손절", "#ef5350")]
         else:
@@ -3851,7 +3983,15 @@ def render_easy(ev, name, rate, qty_dec, long_mode, premium=None):
             c3.metric("📍 지금 가격", _won(ev['curr'] * rate, small))
             if z:
                 lines = [(z['hi'] * rate, "다시 볼 가격", "#fbbf24")]
-        st.caption(f"살 양은 '손절 가격까지 떨어져도 총자산의 {RISK_PER_TRADE:g}% 이내만 잃도록' 계산했어요. 총자산과 %는 왼쪽 사이드바에서 바꿀 수 있어요.")
+        if lad.get('shares'):
+            pl_ = lad.get('plan_loss_pct', float('nan'))
+            st.caption(f"차수마다 정한 주식 수({'·'.join(str(x) for x in SHARES_PER_TRANCHE)}주)로 사요. 1·2·3차를 다 사고 손절되면 "
+                       f"{_won(lad.get('plan_loss', 0))}" + (f" (총자산의 {pl_:.1f}%)" if np.isfinite(pl_) else "") + "를 잃어요. 수량은 왼쪽 사이드바에서 바꿀 수 있어요.")
+            if np.isfinite(pl_) and pl_ > 10:
+                st.warning(f"다 사고 손절되면 총자산의 {pl_:.0f}%를 잃는 계획이에요. 1차만 사거나 이번엔 넘어가는 것도 생각해 보세요.")
+        else:
+            st.caption(f"살 양은 '손절 가격까지 떨어져도 총자산의 {RISK_PER_TRADE:g}% 이내만 잃도록' 계산했어요. 1·2·3차로 나눠 사서 한 번에 다 사지 않아요. "
+                       "총자산과 %는 왼쪽 사이드바에서 바꿀 수 있어요.")
     else:
         plan = long_term_plan(ev['ict'], ev['v'])
         if plan:
@@ -3918,7 +4058,9 @@ def easy_go_rows():
     allr = allr.drop_duplicates(subset=["티커"], keep="last")
     go_ = allr[allr["_kind"].astype(str) == "BUY"].copy()
     go_["_ord"] = go_["단계"].map({x: i for i, x in enumerate(STAGE_ORDER)}).fillna(99)
-    return go_.sort_values(["_ord", "시장"]), scanned
+    go_["_ref"] = [0 if (trade_scope(t, s)[0] and "신규 상장" not in str(b)) else 1
+                   for t, s, b in zip(go_["티커"], go_.get("섹터", pd.Series(None, index=go_.index)), go_.get("비고", pd.Series("", index=go_.index)))]
+    return go_.sort_values(["_ref", "_ord", "시장"]), scanned
 
 
 def render_easy_top():
@@ -3956,7 +4098,8 @@ def render_easy_top():
         mk = r.get("시장", "")
         with cols[k % 2]:
             with st.container(border=True):
-                st.markdown(f"**{r['종목']}** · {mk.split(' ')[0]} {r.get('섹터', '')}")
+                ref_ = int(r.get('_ref', 0) or 0) == 1
+                st.markdown(f"**{r['종목']}** · {mk.split(' ')[0]} {r.get('섹터', '')}" + (" · 🏷️ 참고용" if ref_ else ""))
                 st.caption(f"{EASY_STAGE_TXT.get(r['단계'], r['단계'])} · 지금 {_fmt_px(r['현재가'], mk)} · 손절까지 {_fmt_pct(r.get('손절선까지'))}"
                            + (f" · 실적 {r['실적']}" if str(r.get('실적') or "") else ""))
                 if st.button("자세히 보기", key=f"easy_go_{r['티커']}"):
@@ -3964,7 +4107,8 @@ def render_easy_top():
                     st.session_state["easy_pick"] = f"{r['종목']} ({r['티커']})"
     if len(go_) > 12:
         st.caption(f"외 {len(go_) - 12}개 — 🔎 스크리너 탭에서 전체를 볼 수 있어요.")
-    st.caption("같은 업종 종목은 같이 움직여요. 여러 개가 떠도 업종마다 하나씩, 동시에 2~3종목까지만 사세요.")
+    st.caption("같은 업종 종목은 같이 움직여요. 여러 개가 떠도 업종마다 하나씩, 동시에 2~3종목까지만 사세요. "
+               "🏷️ 참고용(ETF·레버리지·코인·원자재·상장 1년 미만)은 검증에서 엣지가 없거나 검증 범위 밖이라 실제 돈으로는 사지 않아요.")
 
 
 def render_easy_board(res, market):
@@ -4014,17 +4158,91 @@ market_choice = st.sidebar.radio("트레이딩 룸 선택", tabs)
 # ---------- 자금 관리: 결론 배너 · 사다리 · 포지션 관리가 함께 사용 ----------
 st.sidebar.divider()
 st.sidebar.markdown("##### 💰 자금 관리")
-_eq = st.sidebar.number_input("총 투자자산 (원)", min_value=0.0, value=10_000_000.0, step=1_000_000.0, format="%.0f",
-                              help="현금만이 아니라 이 전략에 쓰는 자산 전체(보유 종목 평가액 + 현금)를 넣으세요. 수량은 이 금액 기준으로 계산됩니다.")
-EQUITY = float(_eq) if isinstance(_eq, (int, float)) and _eq > 0 else 10_000_000.0
-_rk = st.sidebar.number_input("1회 허용 손실 (%)", min_value=0.25, max_value=5.0, value=1.0, step=0.25, format="%.2f",
-                              help="손절됐을 때 총자산의 몇 %까지 잃을지. 큰 계좌는 1%, 100만~300만 원대 작은 계좌는 2% 정도가 현실적입니다.")
-RISK_PER_TRADE = float(_rk) if isinstance(_rk, (int, float)) and _rk > 0 else 1.0
+def _qp_num(key, default, lo, hi):
+    """주소창(?eq=...&risk=...)에 저장된 설정 읽기 — 새로고침·재방문해도 유지 (북마크 권장)"""
+    try:
+        v = float(st.query_params.get(key, default))
+        return v if lo <= v <= hi else default
+    except Exception:
+        return default
+
+
+def account_rules(risk):
+    """1회 손실 %에 맞춘 계좌 정지 규칙 (v1.0 견고성 검증 · 실전 대상 신호 7년 계좌 시뮬레이션 기준)
+    월 정지 = 1회 손실의 5배(3~10%) · 중단선 = 전략이 정상이어도 걸릴 확률이 10% 안팎이 되는 낙폭"""
+    month = max(3.0, min(10.0, 5 * risk))
+    mdd = 15 if risk <= 0.5 else 25 if risk <= 1.0 else 30 if risk <= 1.5 else 35 if risk <= 2.0 else 40
+    typical = 10 if risk <= 0.5 else 17 if risk <= 1.0 else 22 if risk <= 1.5 else 26 if risk <= 2.0 else None
+    return month, mdd, typical
+
+
+_eq = st.sidebar.number_input("총 투자자산 (원)", min_value=0.0, value=_qp_num("eq", 1_000_000.0, 10_000.0, 1e13), step=100_000.0,
+                              format="%.0f", key="set_eq",
+                              help="현금만이 아니라 이 전략에 쓰는 자산 전체(보유 종목 평가액 + 현금). 입금하면 늘리세요 — 수량이 자동으로 커집니다. "
+                                   "비트코인 장기 적립 자금은 빼고 넣으세요.")
+EQUITY = float(_eq) if isinstance(_eq, (int, float)) and _eq > 0 else 1_000_000.0
+_rk = st.sidebar.number_input("1회 허용 손실 (%)", min_value=0.25, max_value=5.0, value=_qp_num("risk", 2.0, 0.25, 5.0), step=0.25,
+                              format="%.2f", key="set_rk",
+                              help="손절됐을 때 총자산의 몇 %를 잃을지 (사는 금액이 아님). 검증상 2%까지가 감당 가능한 상한입니다.")
+RISK_PER_TRADE = float(_rk) if isinstance(_rk, (int, float)) and _rk > 0 else 2.0
+try:                                                # 설정을 주소창에 저장 → 이 주소를 북마크하면 다음에도 그대로
+    if st.query_params.get("eq") != f"{EQUITY:.0f}" or st.query_params.get("risk") != f"{RISK_PER_TRADE:g}":
+        st.query_params["eq"] = f"{EQUITY:.0f}"
+        st.query_params["risk"] = f"{RISK_PER_TRADE:g}"
+except Exception:
+    pass
+_MODE_LBL = {"shares": "주 단위 (차수마다 정한 주식 수)", "risk": "손실 % 기준 (자동 계산)"}
+try:
+    _m0 = str(st.query_params.get("mode", "shares"))
+except Exception:
+    _m0 = "shares"
+_m = st.sidebar.radio("매수 수량 방식", list(_MODE_LBL.values()), index=1 if _m0 == "risk" else 0, key="set_mode",
+                      help="주 단위: 계좌 크기와 상관없이 1·2·3차에 정한 주식 수만큼 삽니다. 손실 % 기준: 손절 시 총자산의 '1회 허용 손실 %'만 잃도록 수량을 계산합니다.")
+SIZE_MODE = "risk" if _m == _MODE_LBL["risk"] else "shares"
+if SIZE_MODE == "shares":
+    try:
+        _sh0 = [int(x) for x in str(st.query_params.get("sh", "1-1-1")).split("-")][:3]
+        _sh0 = _sh0 if len(_sh0) == 3 and all(0 <= x <= 10000 for x in _sh0) else [1, 1, 1]
+    except Exception:
+        _sh0 = [1, 1, 1]
+    _c = st.sidebar.columns(3)
+    _sh = []
+    for k_, (col_, d_, nm_) in enumerate(zip(_c, _sh0, ("1차", "2차", "3차"))):
+        v_ = col_.number_input(f"{nm_} (주)", min_value=0, max_value=10000, value=int(d_), step=1, key=f"set_sh{k_}")
+        _sh.append(int(v_) if isinstance(v_, (int, float)) else int(d_))
+    SHARES_PER_TRANCHE = tuple(_sh)
+try:
+    _want = {"mode": SIZE_MODE}
+    if SIZE_MODE == "shares":
+        _want["sh"] = "-".join(str(x) for x in SHARES_PER_TRANCHE)
+    for k_, v_ in _want.items():
+        if st.query_params.get(k_) != v_:
+            st.query_params[k_] = v_
+except Exception:
+    pass
 US_QTY_DEC = US_QTY_DEC_MAX if st.sidebar.checkbox("미국 주식 소수점 매수 (토스 등)", value=True,
                                                    help="끄면 미국 주식도 1주 단위로 계산합니다.") else 0
 st.sidebar.caption(f"🔖 엔진 {APP_VERSION}")
-st.sidebar.caption(f"1회 허용 손실 {RISK_PER_TRADE:g}% = ₩{EQUITY * RISK_PER_TRADE / 100:,.0f} · 한 종목 최대 {MAX_POSITION_PCT:g}% · "
-                   "총자산은 현금이 아니라 투자 자산 전체 기준")
+st.sidebar.caption((f"주 단위: 1·2·3차 {'·'.join(str(x) for x in SHARES_PER_TRANCHE)}주 (계좌 크기와 무관) · 손절 시 손실은 종목마다 화면에 표시 · "
+                    if SIZE_MODE == "shares" else
+                    f"1회 허용 손실 {RISK_PER_TRADE:g}% = ₩{EQUITY * RISK_PER_TRADE / 100:,.0f} (손절 시 잃는 돈) · 한 종목 최대 {MAX_POSITION_PCT:g}% · ")
+                   + "설정은 주소창에 저장돼요 — 이 페이지를 북마크하세요")
+if RISK_PER_TRADE > 2.0:
+    st.sidebar.warning("1회 2%를 넘기면 검증상 수익보다 큰 낙폭·파산 위험이 더 빨리 커집니다.")
+_mh, _mdd, _typ = account_rules(RISK_PER_TRADE)
+with st.sidebar.expander("📏 계좌 규칙 (꼭 지키기)", expanded=False):
+    st.markdown(
+        (f"- **주 단위 매수**: 1·2·3차 {'·'.join(str(x) for x in SHARES_PER_TRANCHE)}주. 손절 시 손실이 총자산의 10%를 넘는 계획이면 경고가 떠요\n"
+         if SIZE_MODE == "shares" else
+         f"- **1회 손실 {RISK_PER_TRADE:g}%** = ₩{EQUITY * RISK_PER_TRADE / 100:,.0f}. 1·2·3차로 나눠 사도 합쳐서 이 금액까지만\n")
+        +
+        f"- **동시 최대 3종목**, 같은 섹터는 1종목\n"
+        f"- **실전 대상**: 국내·미국 개별주만 (ETF·레버리지·코인·원자재·상장 1년 미만은 참고)\n"
+        f"- **이번 달 손실 −{_mh:g}%** → 그 달 신규 매수 중단\n"
+        f"- **고점 대비 −{_mdd}%** → 매매 중단하고 점검" + (f" (이 리스크에서 정상적인 낙폭도 중간값 −{_typ}% 정도)" if _typ else "") + "\n"
+        f"- **조기 중단**: 처음 30건 중 손절·본절 22건 이상, 또는 15연속 손실 (10연속은 정상 범위)\n"
+        f"- **익절 서두르지 않기**: 수익 대부분은 가끔 오는 큰 수익에서 나와요. 트레일링 매도 신호까지 보유\n"
+        f"- 입금은 '총 투자자산'만 늘리고, 매매 성적은 매매일지의 R로 따로 봐요")
 TF_OPTIONS = ["15분", "1시간", "4시간", "1일", "주봉", "월봉"]
 
 # ---------- 사이드바 하단: 선택한 트레이딩 룸에 맞는 매크로 지표만 표시 ----------
@@ -4379,7 +4597,9 @@ elif market_choice == "🔎 스크리너 (Screener)":
             st.info("조건에 맞는 후보가 없습니다. 하락장에서는 후보가 없는 게 정상일 수 있습니다 — 억지로 찾지 마세요.")
         else:
             view = pd.DataFrame({
-                "등급": cand["등급"].fillna("-"), "결론": cand["결론"], "단계": cand["단계"],
+                "등급": cand["등급"].fillna("-"), "결론": cand["결론"],
+                "실전": ["✓" if (trade_scope(t_, s_)[0] and "신규 상장" not in str(b_)) else "참고"
+                       for t_, s_, b_ in zip(cand["티커"], cand["섹터"], cand.get("비고", pd.Series("", index=cand.index)))], "단계": cand["단계"],
                 "종목": cand["종목"] + " (" + cand["티커"] + ")", "섹터": cand["섹터"],
                 "실적": cand["실적"].fillna("") if "실적" in cand.columns else "", "빠진 조건": cand["빠진조건"].fillna(""),
                 "섹터 흐름": [flow_txt(m_, s_) for m_, s_ in zip(cand["시장"], cand["섹터"])],
