@@ -4,6 +4,7 @@ import yfinance as yf
 import pandas as pd
 import numpy as np
 import math
+import os
 import pandas_ta as ta  # noqa: F401  (df.ta 접근자 등록용)
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
@@ -1531,7 +1532,7 @@ GRADE_B_MULT = 0.5            # B급(조건부) 신호의 리스크 배수 (GRAD
 GRADE_ACTIVE = False          # 등급으로 매수 여부·비중을 바꿀지. 검증(2019~2026, 43종목)에서 A급이 B급보다 나빠 지금은 참고 표시만
 ICT_MIN_STOP_PCT = 3.0        # 손절폭 최소값(%): 검증에서 손절폭 3% 이하 신호는 손절 비율 73~87%로 잡음에 털림
 ICT_MIN_STOP_ATR = 1.0        # 손절폭 최소값(ATR 배수) — 둘 중 넓은 쪽 적용
-APP_VERSION = "v1.1.1 (2026-11-17 · 1차에 한 번에 · 2% 기준 수량 · 26주 수요 구간 · 수익 보호형 청산 · 기술적 지표 요약(참고))"
+APP_VERSION = "v1.2 (2026-11-19 · 청산 A 확정: 본전 후 22일 최고가 − 3 ATR · 부분 익절·추가 매수 없음 · 확장 종목 universe.csv)"
 ICT_BOX_SWEEP = False         # 박스권 스윕(와이코프 스프링) 인정 — v1.0 검증(2019~2026, 43종목)에서 신호 9건·효과 없음(OOS 소폭 악화)으로 끔
 BOX_MIN_N, BOX_MAX_N = 4, 15  # 박스로 볼 봉 수 범위
 BOX_MAX_RANGE_ATR = 1.5       # 박스 높이(고가−저가)가 이 배수(ATR) 이하일 때만 박스로 인정 (BTC 2026-10-30~11-03 박스 ≈ 0.6 ATR)
@@ -3472,7 +3473,7 @@ SELL_STYLE = {
 
 POS_STYLE = {
     "STOP":    dict(title="🔴 손절: 전량 매도", bg="#c62828"),
-    "EXIT":    dict(title="🔴 전량 매도 (이익 보호)", bg="#c62828"),
+    "EXIT":    dict(title="🔴 전량 매도 (추세 이탈 · 본전 스탑)", bg="#c62828"),
     "HALF":    dict(title="🟠 절반 익절 (비중 축소)", bg="#e65100"),
     "TP1":     dict(title="🟠 1차 익절 (50%)", bg="#e65100"),
     "ADD":     dict(title="🔵 추가 매수", bg="#1565c0"),
@@ -3498,141 +3499,9 @@ def position_suggest_stop(df, avg_px, qty, bought, qty_dec=0, equity=10_000_000.
     return r['px'] - 2 * r['atr'], "현재가 − 2 ATR"
 
 
-POS_EXIT_MODES = ["수익 보호형 (기본 · 이익 잠금 + 추세 꺾임 매도)", "추세 추종형 (백테스트 검증 · 22봉 최고가 − 3 ATR)"]
-# 수익 보호형: 오른 만큼 손절을 평단 위로 올려 이익을 잠그고, 상승 추세가 꺾이면 판다 (매수·최초 손절은 그대로)
-PROTECT_LOCKS = ((1.0, 0.0), (1.5, 0.5), (2.0, 1.0))   # (최고 미실현 R, 손절을 평단 + 몇 R로) — 2R부터는 1R 오를 때마다 1R씩 더 올림
-PROTECT_HALF_R = 2.0                                    # +2R에 절반 익절 (2주 이상일 때, 미리 지정가 매도 주문)
-PROTECT_ACTIVE_R = 1.0                                  # 최고 +1R 이상 간 뒤부터 '추세 꺾임' 매도 규칙 작동
-PROTECT_EMA = 20                                        # 추세선: 20일 지수이평 — 종가가 2일 연속 아래면 꺾임
+# v1.2 청산 = A 하나 (2026-11-19 확정). 수익 보호형(K)·1:1 따라 올리기·반반·부분 익절·눌림 추매는 검증에서 탈락 또는 보류
+#   (backtest/exit_validate.py · v12_validate.py 결과: 일찍 팔수록 신호당 −0.06~−0.35R, 추매 효과는 2025년 한 해에 집중)
 EXIT_TRAIL_N, EXIT_TRAIL_ATR = 22, 3.0   # 검증된 청산: 본절 이동 후 '최근 22봉 최고가 − 3 ATR' (backtest/robust_validate.py simulate_exit와 같음)
-
-
-def protect_lock(mfe):
-    """최고 미실현 이익(R) → 손절을 평단 + 몇 R까지 올리나 (None = 아직 올리지 않음)"""
-    if mfe >= 2.0:
-        return float(np.floor(mfe) - 1.0)
-    lv = None
-    for th, lk in PROTECT_LOCKS:
-        if mfe >= th:
-            lv = lk
-    return lv
-
-
-def protect_exit(df, entry_date, entry, stop, half=True):
-    """
-    수익 보호형 청산을 첫 매수일부터 마지막 마감 봉까지 따라가 '지금 상태'를 돌려줌 (backtest/exit_validate.py의 K와 같은 규칙)
-      ① 장중 저가가 손절선에 닿으면 매도 (스탑 주문) — 손절선은 처음엔 매수 때 정한 손절가
-      ② 최고가가 +1R → 손절선 = 평단 · +1.5R → 평단 + 0.5R · +2R → 평단 + 1R · 이후 1R 오를 때마다 1R씩 (올리기만, 장중 스탑)
-      ③ +2R에 절반 익절 (2주 이상일 때 미리 지정가 매도)
-      ④ 최고 +1R 이상 간 뒤 상승 추세가 꺾이면 남은 물량 전량 매도 (다음 날 시가):
-         · 종가가 '매수 후 생긴 가장 최근 스윙 저점(좌우 2봉)' 아래 마감 (구조 이탈)
-         · 종가가 20일 지수이평 아래로 2일 연속 마감
-    """
-    dc = closed_bars(df)
-    tm = pd.to_datetime(dc['time'])
-    try:
-        tm = tm.dt.tz_localize(None)
-    except (TypeError, AttributeError):
-        pass
-    o, h, l, c = (dc[k].to_numpy(dtype=float) for k in ('open', 'high', 'low', 'close'))
-    n = len(c)
-    ema = pd.Series(c).ewm(span=PROTECT_EMA, adjust=False, min_periods=PROTECT_EMA).mean().to_numpy()
-    risk = entry - stop
-    k0 = int(np.searchsorted(tm.dt.normalize().to_numpy(), np.datetime64(pd.Timestamp(entry_date).normalize())))
-    out = dict(state="HOLD", sl=float(stop), lock=None, mfe=0.0, hi=None, half_time=None, swl=None, below=0,
-               ema=float(ema[-1]) if n and np.isfinite(ema[-1]) else None, active=False, hit_time=None, why=None, k0=k0, n=n)
-    if k0 >= n or risk <= 0:
-        return out
-    sl, hi, half_t, swl, below = float(stop), -np.inf, None, np.nan, 0
-    for k in range(k0, n):
-        if l[k] <= sl:
-            return dict(out, state="STOPPED", sl=sl, hit_time=tm.iloc[k], mfe=max(0.0, (hi - entry) / risk) if np.isfinite(hi) else 0.0,
-                        hi=hi if np.isfinite(hi) else None, half_time=half_t, why="stop")
-        if half and half_t is None and h[k] >= entry + PROTECT_HALF_R * risk:
-            half_t = tm.iloc[k]
-        active = np.isfinite(hi) and (hi - entry) / risk >= PROTECT_ACTIVE_R
-        below = below + 1 if (np.isfinite(ema[k]) and c[k] < ema[k]) else 0
-        if active:
-            why = None
-            if np.isfinite(swl) and c[k] < swl:
-                why = f"종가가 매수 후 스윙 저점 {_fmt_price(swl)} 아래로 마감 (구조 이탈)"
-            elif below >= 2:
-                why = f"종가가 {PROTECT_EMA}일 지수이평 아래로 2일 연속 마감"
-            if why:
-                return dict(out, state="EXIT", sl=sl, hit_time=tm.iloc[k], mfe=(hi - entry) / risk, hi=hi, half_time=half_t,
-                            swl=swl if np.isfinite(swl) else None, below=below, why=why, late=k < n - 1, active=True)
-        hi = max(hi, h[k])
-        mfe = (hi - entry) / risk
-        lk = protect_lock(mfe)
-        if lk is not None:
-            sl = max(sl, entry + lk * risk)
-        j = k - 2
-        if j - 2 >= 0 and j >= k0 and l[j] < min(l[j - 1], l[j - 2], l[j + 1], l[j + 2]):
-            swl = l[j]
-    mfe = (hi - entry) / risk
-    return dict(out, sl=sl, lock=protect_lock(mfe), mfe=mfe, hi=hi, half_time=half_t, swl=swl if np.isfinite(swl) else None,
-                below=below, active=mfe >= PROTECT_ACTIVE_R)
-
-
-def _position_plan_protect(df, r, ict, lad, avg_px, qty, bought, my_stop, rate, equity, entry_date, half_done, qty_dec):
-    """'수익 보호형' 모드: 이익이 나면 손절을 평단 위로 잠그고, 상승 추세가 꺾이면 판다"""
-    px, lc, atr = r['px'], r['last_close'], r['atr']
-    risk = avg_px - my_stop if my_stop < avg_px else (atr or avg_px * 0.05)
-    can_half = (qty * 0.5 >= (10 ** -qty_dec if qty_dec else 1)) and not half_done
-    if entry_date is not None:
-        vx = protect_exit(df, entry_date, avg_px, avg_px - risk, half=can_half)
-        exact = True
-    else:                                                   # 매수일을 모르면 최고가를 알 수 없음 → 잠금 계산 안 함 (손절선이 내려가는 일 방지)
-        dc = closed_bars(df)
-        ema = dc['close'].ewm(span=PROTECT_EMA, adjust=False, min_periods=PROTECT_EMA).mean()
-        vx = dict(state="HOLD", sl=my_stop, lock=None, mfe=0.0, hi=None, half_time=None, swl=None,
-                  below=int((dc['close'].tail(2) < ema.tail(2)).sum()), ema=float(ema.iloc[-1]), active=False, hit_time=None, why=None)
-        exact = False
-    stop = float(vx['sl'])
-    tgt_half = avg_px + PROTECT_HALF_R * risk
-    reasons, action, add_row = [], "HOLD", None
-    st_ = vx['state']
-    if st_ == "STOPPED":
-        action = "STOP" if stop < avg_px else "EXIT"
-        reasons.append(f"{_tdate(vx['hit_time'])}에 장중 저가가 손절선 {_fmt_price(stop)}에 닿았습니다"
-                       + (" (이익 잠금선)" if stop > avg_px else " (본절)" if abs(stop - avg_px) < 1e-9 else "")
-                       + ". 스탑 주문이 체결되지 않았다면 지금 남은 물량을 모두 팝니다.")
-    elif st_ == "EXIT":
-        action = "EXIT"
-        reasons.append(f"📉 상승 추세 꺾임: {_tdate(vx['hit_time'])} {vx['why']} → "
-                       + ("이미 다음 날 시가에 팔았어야 합니다. 지금 남은 물량을 모두 팝니다." if vx.get('late') else "다음 날 시가에 남은 물량을 모두 팝니다."))
-    elif vx.get('half_time') is not None and can_half:
-        action = "HALF"
-        reasons.append(f"{_tdate(vx['half_time'])}에 +{PROTECT_HALF_R:g}R({_fmt_price(tgt_half)})에 닿았습니다 → 절반을 익절합니다 "
-                       "(지정가 주문이 체결됐다면 '절반 익절 이미 함'에 체크하고 남은 수량을 입력하세요).")
-    else:                                                    # v1.1: 1차만 사고 추가 매수(2·3차)는 하지 않음
-        if vx.get('lock') is None:
-            if exact:
-                reasons.append(f"아직 +1R({_fmt_price(avg_px + risk)})에 닿지 않았습니다. 매수 때 정한 손절가에 장중 스탑을 걸어 두고 기다립니다.")
-        else:
-            lk = vx['lock']
-            reasons.append(f"최고 +{vx['mfe']:.1f}R까지 올라 손절선을 {'평단' if lk == 0 else f'평단 + {lk:g}R'}({_fmt_price(stop)})으로 올렸습니다 — "
-                           + ("이제 손해 볼 일은 없습니다." if lk == 0 else f"최소 +{lk:g}R 이익이 잠겼습니다."))
-            reasons.append(f"상승 추세 유지 중 — 종가가 {PROTECT_EMA}일 지수이평({_fmt_price(vx['ema']) if vx.get('ema') else '-'}) 아래로 2일 연속 마감"
-                           + (f"하거나 스윙 저점 {_fmt_price(vx['swl'])} 아래로 마감" if vx.get('swl') else "") + "하면 다음 날 시가에 팝니다.")
-            if vx.get('below') == 1:
-                action = "CAUTION"
-                reasons.append(f"⚠️ 어제 종가가 {PROTECT_EMA}일 지수이평 아래입니다. 오늘도 아래로 마감하면 다음 날 시가에 팝니다.")
-    if not exact:
-        reasons.insert(0, "📅 '첫 매수일'을 넣어 주세요 — 매수 후 최고가를 알아야 이익 잠금선과 추세 꺾임 매도를 계산합니다 "
-                          "(지금은 매수 때 손절가만 표시).")
-    warn = r['soft']
-    if warn and action in ("HOLD", "ADD"):
-        reasons.append("참고 경고: " + " · ".join(warn))
-    loss = (stop - avg_px) * qty
-    return dict(r=r, ict=ict, lad=lad, action=action, reasons=reasons, stop=stop,
-                stop_kind=("매수 때 정한 손절가 (장중 스탑)" if vx.get('lock') is None else
-                           f"이익 잠금선: 평단 + {vx['lock']:g}R (최고 +{vx['mfe']:.1f}R 도달 · 장중 스탑)"),
-                dist=(stop / px - 1), loss=loss, loss_krw=loss * rate, loss_pct=loss * rate / equity * 100,
-                tp=None, tp_label="-", trail=None, add_row=add_row, px=px, last_close=lc,
-                pnl=(px - avg_px) * qty, pnl_pct=(px / avg_px - 1) * 100, be_line=avg_px + risk, be_hit=vx.get('lock') is not None,
-                be_src="+1R", trend=False, valid=False, protect=True, exact=exact, vx=vx, risk=risk, atr=atr,
-                tgt_half=tgt_half, can_half=can_half)
 
 
 def validated_exit(df, entry_date, entry, stop, be_line):
@@ -3655,7 +3524,8 @@ def validated_exit(df, entry_date, entry, stop, be_line):
     atr = pd.Series(np.maximum(h - l, np.maximum(abs(h - pc), abs(l - pc)))).rolling(14).mean().to_numpy()
     hh = pd.Series(h).rolling(EXIT_TRAIL_N, min_periods=1).max().to_numpy()
     k0 = int(np.searchsorted(tm.dt.normalize().to_numpy(), np.datetime64(pd.Timestamp(entry_date).normalize())))
-    out = dict(state="HOLD", be=False, sl=float(stop), be_time=None, hit_time=None, hit_px=None, k0=k0, n=n)
+    line = float(hh[-1] - EXIT_TRAIL_ATR * atr[-1]) if n and np.isfinite(atr[-1]) else None   # 오늘 기준 추세선 (참고)
+    out = dict(state="HOLD", be=False, sl=float(stop), be_time=None, hit_time=None, hit_px=None, k0=k0, n=n, line=line)
     if k0 >= n:
         return out                                            # 아직 마감된 봉이 없음 (오늘 산 경우)
     sl, be = float(stop), False
@@ -3676,17 +3546,40 @@ def validated_exit(df, entry_date, entry, stop, be_line):
     return dict(out, be=be, sl=sl)
 
 
+def signal_choch_level(df, entry_date, window=500):
+    """첫 매수일 전날(신호 봉) 기준의 돌파선(CHoCH) — 백테스트가 본절 기준으로 쓰는 값과 같게 '매수 당시' 구조로 계산.
+    오늘 구조로 다시 계산하면 날마다 값이 바뀌어 손절선이 백테스트와 달라질 수 있음"""
+    try:
+        t = pd.to_datetime(df['time'])
+        try:
+            t = t.dt.tz_localize(None)
+        except (TypeError, AttributeError):
+            pass
+        raw = df.loc[(t < pd.Timestamp(entry_date).normalize()).to_numpy(), ['time', 'open', 'high', 'low', 'close', 'volume']]
+        if len(raw) < 120:
+            return None
+        w = raw.tail(window).reset_index(drop=True)
+        d = add_indicators(w)
+        info = analyze_market_cycle(d, daily_regime(d), None, False)
+        ic = ict_analysis(d, info)
+        lv = (ic.get('choch') or {}).get('level') or (ic.get('sweep') or {}).get('choch_level')
+        return float(lv) if lv else None
+    except Exception:
+        return None
+
+
 def _position_plan_valid(df, r, ict, lad, avg_px, qty, bought, my_stop, rate, equity, entry_date):
     """'검증된 규칙' 모드: 손절·본절·트레일링만으로 판단 (백테스트와 1:1). 꺾임 경고·구조 붕괴는 참고 문구로만 보여 줌"""
     info, px, lc, atr = r['info'], r['px'], r['last_close'], r['atr']
     L = info['levels']
     risk = avg_px - my_stop if my_stop < avg_px else None
-    chl = ((ict or {}).get('choch') or {}).get('level') or ((ict or {}).get('sweep') or {}).get('choch_level')
-    if not chl and lad and not lad.get('err'):
+    chl0 = signal_choch_level(df, entry_date) if entry_date is not None else None
+    chl = chl0 or ((ict or {}).get('choch') or {}).get('level') or ((ict or {}).get('sweep') or {}).get('choch_level')
+    if not chl0 and not chl and lad and not lad.get('err'):
         r2 = next((x for x in lad['rows'] if x['n'] == 2), None)
         chl = r2['price'] / rate if r2 else None
     if chl and chl > avg_px:
-        be_line, be_src = float(chl), "돌파선(CHoCH)"
+        be_line, be_src = float(chl), "돌파선(CHoCH · 매수 당시)" if chl0 else "돌파선(CHoCH)"
     elif risk:
         be_line, be_src = avg_px + risk, "평단 + 1R(손절폭만큼 위)"
     else:
@@ -3721,18 +3614,15 @@ def _position_plan_valid(df, r, ict, lad, avg_px, qty, bought, my_stop, rate, eq
         action = "STOP" if stop < avg_px else "EXIT"
         reasons.append(f"종가 {_fmt_price(lc)}가 손절선 {_fmt_price(stop)} 아래입니다. 전량 매도합니다.")
     else:
-        if bought in (1, 2) and lad and not lad.get('err'):
-            add_row = next((x for x in lad['rows'] if x['n'] == bought + 1 and x['status'] == "지금"), None)
-        if add_row and px > stop:
-            action = "ADD"
-            reasons.append(f"사다리 {add_row['n']}차 조건이 지금 충족됐습니다. 손절가는 그대로 두고 {add_row['n']}차를 추가합니다.")
-        elif not be_hit:
+        if not be_hit:
             reasons.append(f"손절가 위에서 정상 보유 중입니다. 손절가에 장중 스탑 주문을 걸어 두고, 종가가 {_fmt_price(be_line) if be_line else '돌파선'}"
                            " 위로 마감하면 손절가를 평단가로 올립니다.")
         elif intraday:
             reasons.append("본절 이동 완료 — 평단가에 장중 스탑을 걸어 두고, 트레일링이 평단보다 올라오면 종가 기준으로 관리합니다.")
         else:
             reasons.append(f"추세 추종 중 — 종가가 {_fmt_price(stop)} 아래로 마감하는 날, 다음 날 시가에 전량 매도합니다. 그 전에는 팔지 않습니다.")
+        if exact and vx.get('be_time') is not None and len(df) and _tdate(vx['be_time']) == _tdate(closed_bars(df)['time'].iloc[-1]):
+            reasons.insert(0, f"⬆️ 오늘 본전 이동 조건이 됐습니다 → 손절 조건주문을 평단가 {_fmt_price(avg_px)}로 올리세요.")
     if not exact:
         reasons.append("ℹ️ '첫 매수일'을 넣으면 매수 후 지나온 봉을 모두 따라가 백테스트와 똑같은 손절선을 계산합니다 (지금은 오늘 봉만으로 근사).")
     warn = r['hard'] + r['soft']
@@ -3743,10 +3633,10 @@ def _position_plan_valid(df, r, ict, lad, avg_px, qty, bought, my_stop, rate, eq
                 dist=(stop / px - 1), loss=loss, loss_krw=loss * rate, loss_pct=loss * rate / equity * 100,
                 tp=None, tp_label="-", trail=r['trail'], add_row=add_row, px=px, last_close=lc,
                 pnl=(px - avg_px) * qty, pnl_pct=(px / avg_px - 1) * 100, be_line=be_line, be_hit=be_hit, be_src=be_src,
-                trend=False, valid=True, intraday=intraday, exact=exact, vx=vx)
+                trend=False, valid=True, intraday=intraday, exact=exact, vx=vx, risk=risk)
 
 
-def position_plan(df, avg_px, qty, bought, tp1_done, my_stop, qty_dec=0, equity=10_000_000.0, rate=1.0, exit_mode="protect",
+def position_plan(df, avg_px, qty, bought, tp1_done, my_stop, qty_dec=0, equity=10_000_000.0, rate=1.0, exit_mode="valid",
                   entry_date=None):
     """
     보유 종목 하나의 '지금 할 일'과 손절가 (가격은 종목 통화, 손실 금액은 원화 환산도 함께)
@@ -3764,8 +3654,6 @@ def position_plan(df, avg_px, qty, bought, tp1_done, my_stop, qty_dec=0, equity=
     L = info['levels']
     if exit_mode == "valid":
         return _position_plan_valid(df, r, ict, lad, avg_px, qty, bought, my_stop, rate, equity, entry_date)
-    if exit_mode == "protect":
-        return _position_plan_protect(df, r, ict, lad, avg_px, qty, bought, my_stop, rate, equity, entry_date, tp1_done, qty_dec)
     # 1차 익절 목표: 평단 + 2R(R = 평단 − 내 손절가) 이상에 있는 첫 저항, 없으면 평단 + 2R
     risk = avg_px - my_stop if my_stop < avg_px else (atr or avg_px * 0.05)
     floor_tp = avg_px + POS_TP1_R * risk
@@ -3885,6 +3773,58 @@ REF_ETF = {"SPY", "QQQ", "DIA", "IWM", "VTI", "VOO", "IVV", "SOXX", "SMH", "XLK"
 LEV_ETF = {"SOXL", "TQQQ", "UPRO", "TECL", "TNA", "SPXL", "SQQQ", "SOXS", "LABU", "FNGU", "BULZ", "NVDL", "TSLL", "UDOW"}
 
 
+# ==========================================
+# 📚 확장 종목 (universe.csv) — 토스증권처럼 넓게: S&P 500 · 나스닥 100 · 코스피 200 (+ 인기 종목)
+#   만들기: backtest/build_universe.py → 저장소 맨 위(app.py 옆)에 universe.csv 올리기. 파일이 없으면 위 기본 목록만 씀
+#   실전 대상 여부: 확장 종목은 backtest/oos_validate.py(처음 보는 종목 검증)를 통과한 시장만 EXPANDED_LIVE에 넣음
+# ==========================================
+UNIVERSE_FILE = "universe.csv"
+EXPANDED_LIVE = set()          # 검증 통과 후 {"KR"} · {"US"} · {"KR", "US"} 로 바꾸기 (그 전엔 확장 종목 신호는 참고용)
+UNI_MARKET = {"KR": "🇰🇷 국내 (KOSPI)", "US": "🇺🇸 미국"}
+CORE_TICKERS = {t for mk in UNI_MARKET.values() for items in SCREEN_UNIVERSE.get(mk, {}).values() for t, _ in items}
+
+
+def _universe_path():
+    cands = []
+    f = globals().get("__file__")
+    if f:
+        cands.append(os.path.join(os.path.dirname(os.path.abspath(f)), UNIVERSE_FILE))
+    cands += [os.path.join(os.getcwd(), UNIVERSE_FILE), os.path.join(os.getcwd(), "..", UNIVERSE_FILE)]
+    return next((p for p in cands if os.path.isfile(p)), None)
+
+
+def load_expanded_universe(uni):
+    """universe.csv(market,ticker,name,sector)를 SCREEN_UNIVERSE에 더함. 기본 목록에 있는 종목은 기본 섹터를 유지.
+    반환: {티커: 'KR'|'US'} (새로 더한 종목만)"""
+    p = _universe_path()
+    if not p:
+        return {}
+    try:
+        u = pd.read_csv(p, dtype=str, encoding="utf-8-sig").fillna("")
+    except Exception:
+        return {}
+    have = {t for g in uni.values() for items in g.values() for t, _ in items}
+    added = {}
+    for r in u.to_dict("records"):
+        code = str(r.get("market", "")).strip().upper()
+        mk = UNI_MARKET.get(code)
+        t = str(r.get("ticker", "")).strip().upper()
+        if not mk or not t or t in have:
+            continue
+        sec = str(r.get("sector", "")).strip() or "기타"
+        uni[mk].setdefault(sec, []).append((t, str(r.get("name", "")).strip() or t))
+        have.add(t)
+        added[t] = code
+    for mk in UNI_MARKET.values():                     # ETF 묶음은 맨 뒤로
+        g = uni.get(mk, {})
+        uni[mk] = {k: v for k, v in g.items() if not k.startswith("ETF")} | {k: v for k, v in g.items() if k.startswith("ETF")}
+    return added
+
+
+EXPANDED = load_expanded_universe(SCREEN_UNIVERSE)
+TICKER_SECTOR = {str(t).upper(): sec for groups in SCREEN_UNIVERSE.values() for sec, items in groups.items() for t, _ in items}
+
+
 VALID_MIN_BARS = 250   # 백테스트 검증 범위: 일봉 약 1년(250~260개) 이상 쌓인 종목만 시험함
 
 
@@ -3900,17 +3840,13 @@ def trade_scope(ticker, sector=None, n_bars=None):
     if "=F" in t:
         return False, "원자재 선물 신호는 참고용 (검증 표본이 적음)"
     if sector is None:
-        for groups in SCREEN_UNIVERSE.values():
-            for sec, items in groups.items():
-                if any(str(x[0]).upper() == t for x in items):
-                    sector = sec
-                    break
-            if sector:
-                break
+        sector = TICKER_SECTOR.get(t)
     if t in LEV_ETF or sector == "ETF·레버리지(3x)":
         return False, "레버리지 ETF 신호는 참고용 (검증에서 엣지 없음 · 변동성 손실)"
     if t in REF_ETF or (sector and str(sector).startswith("ETF")) or str(globals().get("market_choice", "")).startswith("📊"):
         return False, "ETF 신호는 참고용 (두 번의 검증 모두 엣지 없음)"
+    if t in EXPANDED and EXPANDED[t] not in EXPANDED_LIVE:
+        return False, "확장 종목 — 처음 보는 종목 검증(oos_validate) 통과 전이라 참고용"
     return True, ""
 
 
@@ -4728,7 +4664,8 @@ def _go_detail(mk, label):
 def _scan_all_markets():
     for mk in SCREEN_UNIVERSE:
         try:
-            with st.spinner(f"{mk} 훑는 중..."):
+            n_mk = sum(len(v) for v in SCREEN_UNIVERSE[mk].values())
+            with st.spinner(f"{mk} {n_mk}종목 훑는 중... (처음 한 번은 몇 분 걸려요)"):
                 rows = scan_market(mk)
             try:
                 rows = apply_earnings(pd.DataFrame(rows)).to_dict("records")
@@ -4744,6 +4681,11 @@ def render_today():
     st.title("🟢 오늘의 매수")
     st.caption("텔레그램 알림과 같은 기준이에요 — 전 시장에서 **1차 매수가 유효한 실전 대상 개별주**만 보여 주고, "
                f"수량은 v1.1 규칙(₩{EQUITY * RISK_PER_TRADE / 100:,.0f} = 총자산 {RISK_PER_TRADE:g}% ÷ 1주 손실)으로 계산해요.")
+    if EXPANDED:
+        n_kr = sum(1 for v in EXPANDED.values() if v == "KR")
+        st.caption(f"📚 확장 종목 {len(EXPANDED)}개(국내 {n_kr} · 미국 {len(EXPANDED) - n_kr})도 함께 훑어요 — "
+                   + ("실전 대상: " + " · ".join({"KR": "국내", "US": "미국"}[m] for m in sorted(EXPANDED_LIVE)) if EXPANDED_LIVE
+                      else "아직 처음 보는 종목 검증 전이라 확장 종목 신호는 아래 '참고' 칸에만 보여요."))
     uidx = _universe_index()
     opts = {f"{n} ({t})": t for t, (sec, n, mk) in uidx.items()}
     try:
@@ -4835,7 +4777,7 @@ def render_today():
     show = tab.drop(columns=[c for c in tab.columns if c.startswith("_")])
     st.dataframe(show, hide_index=True, width="stretch")
     st.caption("주문: 신호 다음 날 시가 · 국내는 동시호가(08:30~09:00), 미국은 정규장 시작용 지정가로 '주문 상한'을 걸어요. "
-               "그보다 높게 시작하면 건너뛰어요. 체결 즉시 '손절가'에 장중 스탑 주문 → 이후 💼 포지션 관리(수익 보호형)로 관리해요.")
+               "그보다 높게 시작하면 건너뛰어요. 체결 즉시 '손절가'에 장중 스탑 주문 → 이후 💼 포지션 관리(추세 추종 A)로 관리해요.")
     st.caption(f"수량 = ₩{R1:,.0f} ÷ 1주 손실(수수료 포함), 소수점 버림 · 미국 종목 원화 환산 환율 ₩{KRW_RATE:,.0f} · "
                "여러 개 중 고르는 기준은 규칙에 없어요 (검증상 국내 종목의 1차 우위가 미국보다 뚜렷했어요).")
     ok_rows = tab[tab["_ok"]]
@@ -4846,9 +4788,13 @@ def render_today():
             nm = uidx.get(r["_t"], (None, r["종목"], None))[1]
             cols[k % len(cols)].button(f"{r['종목']}", key=f"today_go_{r['_t']}", on_click=_go_detail,
                                        args=(r["_mk"], f"{nm} ({r['_t']})"), width="stretch")
-    with st.expander("ℹ️ 1차 신호가 났지만 빠진 종목 (ETF·코인·원자재·상장 1년 미만 · 실적 발표 5일 이내)"):
+    with st.expander("ℹ️ 1차 신호가 났지만 빠진 종목 (확장 종목 검증 전 · ETF·코인·원자재·상장 1년 미만 · 실적 발표 5일 이내)"):
         ref = allr[(allr["_kind"].astype(str) == "BUY") & (pd.to_numeric(allr["_tranche"], errors="coerce") == 1)]
         ref = ref[[not (trade_scope(t, s)[0] and "신규 상장" not in str(b)) for t, s, b in zip(ref["티커"], ref["섹터"], ref["비고"])]]
+        exp_ref = ref[[str(t).upper() in EXPANDED and "신규 상장" not in str(b) for t, b in zip(ref["티커"], ref["비고"])]]
+        if not exp_ref.empty:
+            st.caption("📚 확장 종목(검증 전 · 참고): " + ", ".join(f"{n}({sec})" for n, sec in zip(exp_ref["종목"].astype(str), exp_ref["섹터"].astype(str))))
+            ref = ref.drop(exp_ref.index)
         earn = allr[allr.get("단계", pd.Series("", index=allr.index)).astype(str).str.contains("실적", na=False)]
         if ref.empty and earn.empty:
             st.caption("없어요.")
@@ -4921,15 +4867,16 @@ st.sidebar.caption(f"1회 허용 손실 {RISK_PER_TRADE:g}% = ₩{EQUITY * RISK_
 if RISK_PER_TRADE > 2.0:
     st.sidebar.warning("1회 2%를 넘기면 검증상 수익보다 큰 낙폭·파산 위험이 더 빨리 커집니다.")
 _mh, _mdd, _typ = account_rules(RISK_PER_TRADE)
-with st.sidebar.expander("📏 매매 규칙 v1.1 (꼭 지키기)", expanded=False):
+with st.sidebar.expander("📏 매매 규칙 v1.2 (꼭 지키기)", expanded=False):
     st.markdown(
         f"- **매수**: 🟢 1차(스윕 후 회복)에만, 정한 수량을 **한 번에**. 2·3차 추가 매수 없음\n"
         f"- **수량**: ₩{EQUITY * RISK_PER_TRADE / 100:,.0f}({RISK_PER_TRADE:g}%) ÷ 1주 손실, 소수점 버림. **0주면 건너뜀**, 남은 현금 안에서만\n"
         f"- **주문**: 신호 다음 날 시가 · 상한 = 신호 종가 +{OPEN_CAP_PCT:g}% · 체결 즉시 손절 스탑\n"
         f"- **동시 최대 3종목**, 같은 섹터는 1종목\n"
         f"- **실전 대상**: 국내·미국 개별주만 (ETF·레버리지·코인·원자재·상장 1년 미만은 참고)\n"
-        f"- **매도 (수익 보호형)**: +1R → 손절 평단 · +1.5R → 평단 + 0.5R · +2R → 절반 익절 + 평단 + 1R · 이후 1R마다 1R씩 · "
-        f"최고 +1R 이상 간 뒤 20일 지수이평 2일 이탈 또는 스윙 저점 이탈 → 전량\n"
+        f"- **매도 (추세 추종 A)**: 종가가 손익분기선(돌파선, 없으면 평단 + 1R) 위 마감 → 손절을 평단으로 · "
+        f"그 뒤 '최근 {EXIT_TRAIL_N}봉 최고가 − {EXIT_TRAIL_ATR:g} ATR'을 종가로 깨면 다음 날 시가 전량. 부분 익절·추가 매수 없음\n"
+        f"- **관리**: 주 1회 손절선 확인 · 50거래 전에는 규칙을 바꾸지 않음\n"
         f"- **이번 달 손실 −{_mh:g}%** → 그 달 신규 매수 중단\n"
         f"- **고점 대비 −{_mdd}%** → 매매 중단하고 점검\n"
         f"- **조기 중단**: 15연속 손실 또는 누적 −16R\n"
@@ -5567,7 +5514,7 @@ elif market_choice == "🌊 자금 흐름 (Money Flow)":
 # ==========================================
 elif market_choice == "💼 포지션 관리 (Position)":
     st.title("💼 포지션 관리")
-    st.caption("이미 산 종목 하나를 넣으면 지금 할 일(손절 · 추가 매수 · 익절 · 보유)과 손절가, 손절 시 손실 금액을 계산합니다. "
+    st.caption("이미 산 종목 하나를 넣으면 지금 할 일(손절 · 보유 · 전량 매도)과 손절가, 손절 시 손실 금액을 계산합니다. "
                "새로 살 종목·수량은 🟢 오늘의 매수와 🔍 종목 상세에서, 산 뒤의 관리는 이 탭에서 합니다. (일봉 기준, 장 마감 후 확인 권장)")
 
     s1, s2 = st.columns([1, 2])
@@ -5590,22 +5537,20 @@ elif market_choice == "💼 포지션 관리 (Position)":
     with a2:
         qty = st.number_input("보유 수량", min_value=0.0, value=0.0, step=1.0 if qdec == 0 else 0.0001,
                               format="%.0f" if qdec == 0 else "%.4f", key="sell_qty")
-    b1, b2 = st.columns([2, 1])
-    with b1:
-        mode = POS_MODES[0]                         # v1.1: 1차에 한 번에 산 것으로 봄 (추가 매수 없음)
-        exit_sel = st.radio("매도 방식", POS_EXIT_MODES, index=0, horizontal=True, key="pos_exit",
-                            help="수익 보호형: +1R이면 손절을 평단으로, +1.5R이면 평단 + 0.5R, +2R이면 절반 익절 + 평단 + 1R … "
-                                 "그리고 상승 추세가 꺾이면(20일 지수이평 2일 이탈 · 스윙 저점 이탈) 매도 — 백테스트 검증 전 · "
-                                 "추세 추종형: 큰 추세를 끝까지 타는 대신 +12% 안팎까지는 이익을 지키지 못함 (백테스트 검증됨)")
-    exit_mode = {0: "protect", 1: "valid"}[POS_EXIT_MODES.index(exit_sel)]
+    mode = POS_MODES[0]                             # v1.1~: 1차에 한 번에 산 것으로 봄 (추가 매수 없음)
+    exit_mode = "valid"                             # v1.2: 청산은 A 하나 (본전 후 22일 최고가 − 3 ATR, 백테스트와 같은 계산)
+    tp1_done = False
+    b1, b2 = st.columns([1, 2])
     entry_date = None
-    with b2:
+    with b1:
         try:
-            entry_date = st.date_input("첫 매수일 (1차 체결일)", value=None, key="pos_entry_date",
-                                       help="넣으면 매수 후 지나온 봉을 모두 따라가 손절선·최고가·스윙 저점을 정확히 계산합니다.")
+            entry_date = st.date_input("첫 매수일 (체결일)", value=None, key="pos_entry_date",
+                                       help="넣으면 매수 후 지나온 봉을 모두 따라가 백테스트와 똑같은 손절선을 계산합니다. 꼭 넣으세요.")
         except Exception:
             entry_date = None
-        tp1_done = st.checkbox("절반 익절 이미 함", value=False, key="pos_tp1") if exit_mode == "protect" else False
+    with b2:
+        st.caption("매도 방식: **추세 추종 (A)** — 종가가 손익분기선 위로 마감하면 손절을 평단으로, 그 뒤 '최근 22봉 최고가 − 3 ATR'을 "
+                   "종가로 깨면 다음 날 시가 전량. 부분 익절·추가 매수는 하지 않아요 (v1.2 검증 결과). 주 1회 + 크게 빠진 날 저녁에 확인하세요.")
     bought = 0 if mode == POS_MODES[3] else POS_MODES.index(mode) + 1
     avg_px = avg_px if isinstance(avg_px, (int, float)) else 0.0
     qty = qty if isinstance(qty, (int, float)) else 0.0
@@ -5664,47 +5609,6 @@ elif market_choice == "💼 포지션 관리 (Position)":
 
                 st.markdown("##### 📋 지금 걸어 둘 주문")
                 rows = [{"주문": "🛑 손절 (스탑 감시 주문)", "가격": pxs(pp['stop']), "수량": qtxt(qty), "체결 시 손익": money(pp['loss'])}]
-                if pp.get('protect'):
-                    vx, rk = pp['vx'], pp['risk']
-                    if pp['action'] in ("STOP", "EXIT"):
-                        rows = [{"주문": "🔴 남은 물량 전량 매도 (다음 장 시가)", "가격": pxs(pp['px']), "수량": qtxt(qty), "체결 시 손익": money(pp['pnl'])}]
-                    else:
-                        q1 = _qty_floor(qty * 0.5, qdec)
-                        rows = [{"주문": "🛑 손절·이익 잠금 스탑 주문 (장중 · 이 가격에 닿으면 전량)", "가격": pxs(pp['stop']), "수량": qtxt(qty),
-                                 "체결 시 손익": money(pp['loss'])}]
-                        if pp['action'] == "HALF":
-                            rows.insert(0, {"주문": "🟠 지금 절반 익절", "가격": pxs(pp['px']), "수량": qtxt(q1), "체결 시 손익": money((pp['px'] - avg_px) * q1)})
-                        elif pp.get('can_half'):
-                            rows.append({"주문": f"🎯 절반 익절 지정가 (+{PROTECT_HALF_R:g}R · 미리 걸어 두기)", "가격": pxs(pp['tgt_half']), "수량": qtxt(q1),
-                                         "체결 시 손익": money((pp['tgt_half'] - avg_px) * q1)})
-                        nxt = [(1.0, 0.0, "손절 → 평단 (본전 확보)"), (1.5, 0.5, "손절 → 평단 + 0.5R"), (2.0, 1.0, "손절 → 평단 + 1R")]
-                        m_ = vx.get('mfe') or 0.0
-                        up = next(((t, k, lab) for t, k, lab in nxt if m_ < t), None)
-                        if up is None:
-                            t_ = float(np.floor(m_)) + 1.0
-                            up = (t_, t_ - 1.0, f"손절 → 평단 + {t_ - 1:g}R")
-                        rows.append({"주문": f"⬆️ 다음 이익 잠금: 고가가 +{up[0]:g}R에 닿으면 {up[2]}", "가격": pxs(avg_px + up[0] * rk), "수량": "-",
-                                     "체결 시 손익": f"잠금 {money((up[1] * rk) * qty)}"})
-                        if vx.get('active'):
-                            rows.append({"주문": f"📉 추세 꺾임 감시 (종가 기준): {PROTECT_EMA}일 지수이평 아래 2일 연속 마감 → 다음 날 시가 전량",
-                                         "가격": pxs(vx.get('ema')), "수량": "남은 전부", "체결 시 손익": "-"})
-                            if vx.get('swl'):
-                                rows.append({"주문": "📉 추세 꺾임 감시 (종가 기준): 매수 후 스윙 저점 아래 마감 → 다음 날 시가 전량",
-                                             "가격": pxs(vx['swl']), "수량": "남은 전부", "체결 시 손익": money((vx['swl'] - avg_px) * qty)})
-                    if pp['action'] == "ADD" and pp['add_row']:
-                        ar = pp['add_row']
-                        rows.append({"주문": f"🔵 {ar['n']}차 추가 매수", "가격": pxs(ar['price'] / fx), "수량": qtxt(ar['qty']), "체결 시 손익": "-"})
-                    st.dataframe(pd.DataFrame(rows), hide_index=True)
-                    a_ = pp.get('atr')
-                    st.caption(f"1R(평단 − 매수 때 손절가) = {pxm(rk)} ({rk / avg_px * 100:.1f}%) · ATR(14일) = {pxm(a_)}"
-                               + (f" ({a_ / avg_px * 100:.1f}%)" if a_ else "") + f" · 최고 미실현 +{(vx.get('mfe') or 0):.2f}R")
-                    st.markdown("##### 🧭 파는 규칙 (수익 보호형 · 검증 전)")
-                    st.markdown(f"1. **처음**: 매수 때 정한 손절가({pxm(my_stop)})에 장중 스탑. 앱 판단이 틀렸을 때의 안전장치입니다.")
-                    st.markdown(f"2. **이익 잠금** (고가 기준, 올리기만): +1R({pxm(avg_px + rk)}) → 손절을 평단으로 · +1.5R({pxm(avg_px + 1.5 * rk)}) → 평단 + 0.5R · "
-                                f"+2R({pxm(avg_px + 2 * rk)}) → 평단 + 1R · 이후 1R 오를 때마다 1R씩")
-                    st.markdown(f"3. **절반 익절**: +{PROTECT_HALF_R:g}R({pxm(pp['tgt_half'])})에 절반 지정가 매도 (2주 이상일 때) — 단타 수익을 먼저 확정")
-                    st.markdown(f"4. **추세 꺾임 매도** (최고 +1R 이상 간 뒤): 종가가 {PROTECT_EMA}일 지수이평 아래로 2일 연속 마감하거나, "
-                                "매수 후 생긴 스윙 저점 아래로 마감하면 → 다음 날 시가에 남은 물량 전량")
                 if pp.get('valid'):
                     if pp['action'] in ("STOP", "EXIT"):
                         rows = [{"주문": "🔴 전량 매도 (다음 장 시가)", "가격": pxs(pp['px']), "수량": qtxt(qty), "체결 시 손익": money(pp['pnl'])}]
@@ -5717,10 +5621,14 @@ elif market_choice == "💼 포지션 관리 (Position)":
                     if pp.get('be_line') and not pp.get('be_hit') and pp['action'] not in ("STOP", "EXIT"):
                         rows.append({"주문": f"⬆️ 본절 이동 기준 ({pp.get('be_src', '')} · 종가가 이 위로 마감하면 손절가 → 평단가)",
                                      "가격": pxs(pp['be_line']), "수량": "-", "체결 시 손익": "-"})
-                    if pp['action'] == "ADD" and pp['add_row']:
-                        ar = pp['add_row']
-                        rows.append({"주문": f"🔵 {ar['n']}차 추가 매수", "가격": pxs(ar['price'] / fx), "수량": qtxt(ar['qty']), "체결 시 손익": "-"})
+                    ln = (pp.get('vx') or {}).get('line')
+                    if ln and pp['action'] not in ("STOP", "EXIT") and (not pp.get('be_hit') or pp.get('intraday')):
+                        rows.append({"주문": f"📏 지금의 추세선 (참고 · 최근 {EXIT_TRAIL_N}봉 최고가 − {EXIT_TRAIL_ATR:g} ATR · 평단을 넘으면 이 선이 손절선이 됨)",
+                                     "가격": pxs(ln), "수량": "-", "체결 시 손익": "-"})
                     st.dataframe(pd.DataFrame(rows), hide_index=True)
+                    if pp.get('risk'):
+                        st.caption(f"1R(평단 − 매수 때 손절가) = {pxm(pp['risk'])} ({pp['risk'] / avg_px * 100:.1f}%) · 지금 {pp['pnl_pct']:+.1f}% "
+                                   f"= {(pp['px'] - avg_px) / pp['risk']:+.2f}R")
                     a_ = pp['r'].get('atr')
                     if a_:
                         st.caption(f"ATR(14일) = {pxm(a_)} · 3 ATR = {pxm(3 * a_)} ({3 * a_ / avg_px * 100:.1f}%) · "
@@ -5731,8 +5639,11 @@ elif market_choice == "💼 포지션 관리 (Position)":
                                 + (f" ✅ {_tdate(pp['vx']['be_time'])} 완료" if pp.get('be_hit') and pp['vx'].get('be_time') is not None else (" ✅ 완료" if pp.get('be_hit') else "")))
                     st.markdown(f"3. **그 뒤 매일**: 손절선 = max(지금 손절선, 최근 {EXIT_TRAIL_N}봉 최고가 − {EXIT_TRAIL_ATR:g} ATR) — 올리기만 합니다. "
                                 "손절선이 평단보다 높아지면 장중 스탑 대신 **종가가 손절선 아래로 마감한 날 → 다음 날 시가 전량 매도**.")
-                    st.markdown("4. **절반 매도·목표가 익절은 하지 않습니다.** 꺾임 경고는 참고만 합니다 (백테스트로 검증되지 않음).")
-                if not pp.get('valid') and not pp.get('protect'):
+                    st.markdown("4. **부분 익절·목표가 익절·추가 매수는 하지 않습니다** (v1.2 검증: 일찍 팔면 큰 추세를 놓쳐 신호당 −0.06~−0.35R, "
+                                "눌림 추매는 효과가 2025년 한 해에 몰려 보류). 꺾임 경고는 참고만 합니다.")
+                    st.markdown("5. **관리 주기**: 주 1회 이 화면에서 손절선을 확인해 조건주문을 올리고, 크게 빠진 날은 장 마감 후 한 번 더 확인합니다. "
+                                "텔레그램 알림에 보유 종목(holdings.txt)을 적어 두면 매도·본전 이동을 알려 줍니다.")
+                if not pp.get('valid'):
                     if pp['action'] in ("STOP", "EXIT"):
                         rows = [{"주문": "🔴 다음 봉 시가에 전량 매도", "가격": pxs(pp['px']), "수량": qtxt(qty), "체결 시 손익": money(pp['pnl'])}]
                     elif pp['action'] == "HALF":
@@ -5787,14 +5698,7 @@ elif market_choice == "💼 포지션 관리 (Position)":
                     lines.append((pp['tp'], "1차 익절(50%)", "#26a69a"))
                 if pp['trail'] and not pp.get('valid') and (tp1_done or bought == 0 or pp.get('be_hit')):
                     lines.append((pp['trail'], "트레일링", "#ffa726"))
-                if pp.get('protect'):
-                    if not pp.get('be_hit'):
-                        lines.append((avg_px + pp['risk'], "+1R (손절 → 평단)", "#26a69a"))
-                    if pp.get('can_half'):
-                        lines.append((pp['tgt_half'], f"+{PROTECT_HALF_R:g}R 절반 익절", "#26a69a"))
-                    if pp['vx'].get('swl') and pp['vx'].get('active'):
-                        lines.append((pp['vx']['swl'], "스윙 저점 (구조선)", "#ffa726"))
-                elif pp.get('be_line') and not pp.get('be_hit'):
+                if pp.get('be_line') and not pp.get('be_hit'):
                     lines.append((pp['be_line'], "본절 이동 기준", "#26a69a"))
                 st.plotly_chart(build_chart(df, fibs, 1.0, None, pp['r']['info'], None, extra_lines=lines,
                                             zones=(ict or {}).get('zones')), width="stretch")
